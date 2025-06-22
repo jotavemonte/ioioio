@@ -138,13 +138,6 @@ func (controller *AppController) selectFirstContainer() {
 }
 
 func (controller *AppController) getServiceListView() {
-	statusEmojiMap := map[string]string{
-		"running":    "🟢",
-		"exited":     "🔴",
-		"paused":     "🟡",
-		"restarting": "🟣",
-		"created":    "🔵",
-	}
 
 	serviceTreeView := tview.NewTreeView()
 	serviceTreeView.SetBorder(true)
@@ -183,7 +176,7 @@ func (controller *AppController) getServiceListView() {
 		})
 
 		for _, container := range containers {
-			containerText := statusEmojiMap[container.State] + " " + container.Name
+			containerText := buildContainerText(container)
 			containerNode := tview.NewTreeNode(containerText).
 				SetColor(tcell.ColorWhite).
 				SetReference(container.ID) // Store container ID as reference
@@ -205,6 +198,17 @@ func (controller *AppController) getServiceListView() {
 	})
 
 	controller.ServiceStatusView = serviceTreeView
+}
+
+func buildContainerText(container Container) string {
+	statusEmojiMap := map[string]string{
+		"running":    "🟢",
+		"exited":     "🔴",
+		"paused":     "🟡",
+		"restarting": "🟣",
+		"created":    "🔵",
+	}
+	return statusEmojiMap[container.State] + " " + container.Name
 }
 
 func (controller *AppController) getServiceLogsView() {
@@ -240,56 +244,64 @@ func (controller *AppController) updateServicesStatus(ctx context.Context) {
 		case <-ticker.C:
 			oldContainers := make(map[string]Container)
 			for k, v := range containers {
-				oldContainers[k] = v
+				vCopy := Container{
+					ID:      strings.Clone(v.ID),
+					Name:    strings.Clone(v.Name),
+					Project: strings.Clone(v.Project),
+					State:   strings.Clone(v.State),
+				}
+				oldContainers[strings.Clone(k)] = vCopy
 			}
 
 			controller.getServiceStatus()
 
-			controller.app.QueueUpdateDraw(func() {
-				expansionState := make(map[string]bool)
+			containersToUpdate := []string{}
+			for k, v := range oldContainers {
+				if containers[k].State != v.State {
+					containersToUpdate = append(containersToUpdate, k)
+				}
+			}
+			serviceNodes := make(map[string]*tview.TreeNode)
+			for _, node := range controller.ServiceStatusView.GetRoot().GetChildren() {
+				serviceNodes[node.GetText()] = node
+			}
 
-				root := controller.ServiceStatusView.GetRoot()
-				if root != nil {
-					for _, projectNode := range root.GetChildren() {
-						projectName := projectNode.GetText()
-						expansionState[projectName] = projectNode.IsExpanded()
+			for _, containerID := range containersToUpdate {
+				container := containers[containerID]
+				projectNode, ok := serviceNodes[container.Project]
+				if !ok {
+					continue // Project node not found
+				}
+
+				var containerNode *tview.TreeNode
+				for _, child := range projectNode.GetChildren() {
+					if child.GetReference() == container.ID {
+						containerNode = child
+						break
 					}
 				}
 
-				controller.getServiceListView()
-
-				newRoot := controller.ServiceStatusView.GetRoot()
-				for _, projectNode := range newRoot.GetChildren() {
-					projectName := projectNode.GetText()
-					if expanded, exists := expansionState[projectName]; exists {
-						projectNode.SetExpanded(expanded)
-					}
+				if containerNode == nil {
+					continue // Container node not found
 				}
-			})
+
+				containerText := buildContainerText(container)
+
+				controller.app.QueueUpdateDraw(func() {
+					containerNode.SetText(containerText)
+				})
+			}
 		}
 	}
 }
 
-func main() {
-	var controller AppController
+func (controller *AppController) InitInterface() {
 	app := tview.NewApplication()
 	controller.app = app
-
-	// Initialize Docker client
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating Docker client: %v\n", err)
-		return
-	}
-	defer cli.Close()
-	controller.DockerClient = cli
 
 	controller.getServiceStatus()
 	controller.getServiceListView()
 	controller.getServiceLogsView()
-
-	go controller.logContainerController()
-
 	controller.selectFirstContainer()
 
 	left_box := tview.NewFlex().SetDirection(tview.FlexRow)
@@ -307,15 +319,32 @@ func main() {
 	base_flex.AddItem(left_box, 0, 25, true) // Left panel containing tree view
 	base_flex.AddItem(horizontal_flex, 0, 75, false)
 
-	// Create a context that will be canceled when the application exits
+	if err := controller.app.SetRoot(base_flex, true).EnableMouse(true).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Application error: %v\n", err)
+	}
+}
+
+func (controller *AppController) InitDockerCLI() {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating Docker client: %v\n", err)
+		return
+	}
+
+	controller.DockerClient = cli
+}
+
+func main() {
+	var controller AppController
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start service status updater in a goroutine
+	controller.InitDockerCLI()
+	defer controller.DockerClient.Close()
+
+	go controller.logContainerController()
 	go controller.updateServicesStatus(ctx)
 
-	// Run the application with better error handling
-	if err := app.SetRoot(base_flex, true).EnableMouse(true).Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Application error: %v\n", err)
-	}
+	controller.InitInterface()
 }
