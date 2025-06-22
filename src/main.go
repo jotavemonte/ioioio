@@ -40,6 +40,21 @@ var currentLogsStream *LogsStream = &LogsStream{}
 
 var containers = make(map[string]Container)
 
+func (controller *AppController) setCurrentNodeOnNavigation() {
+	for {
+		if controller.ServiceStatusView == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		containerId := currentLogsStream.ContainerID
+		currentContainerId := controller.ServiceStatusView.GetCurrentNode().GetReference().(string)
+
+		if containerId != currentContainerId {
+			currentLogsStream.ContainerID = currentContainerId
+		}
+	}
+}
+
 func (controller *AppController) logContainerController() {
 	currentContainerId := currentLogsStream.ContainerID
 
@@ -51,6 +66,57 @@ func (controller *AppController) logContainerController() {
 		}
 	}
 
+}
+
+func (controller *AppController) restartContainer() {
+	ctx := context.Background()
+	containerId := currentLogsStream.ContainerID
+
+	if containerId == "" {
+		return
+	}
+
+	err := controller.DockerClient.ContainerRestart(ctx, containerId, containertypes.StopOptions{})
+	if err != nil {
+		fmt.Fprintf(controller.DebugOutput, "Error restarting container %s: %v\n", containerId, err)
+		return
+	}
+
+	fmt.Fprintf(controller.DebugOutput, "Container %s restarted successfully.\n", containerId)
+}
+
+func (controller *AppController) stopContainer() {
+	ctx := context.Background()
+	containerId := currentLogsStream.ContainerID
+
+	if containerId == "" {
+		return
+	}
+
+	err := controller.DockerClient.ContainerStop(ctx, containerId, containertypes.StopOptions{})
+	if err != nil {
+		fmt.Fprintf(controller.DebugOutput, "Error stopping container %s: %v\n", containerId, err)
+		return
+	}
+
+	fmt.Fprintf(controller.DebugOutput, "Container %s stopped successfully.\n", containerId)
+}
+
+func (controller *AppController) startContainer() {
+	ctx := context.Background()
+	containerId := currentLogsStream.ContainerID
+
+	if containerId == "" {
+		return
+	}
+
+	err := controller.DockerClient.ContainerStart(ctx, containerId, containertypes.StartOptions{})
+	if err != nil {
+		fmt.Fprintf(controller.DebugOutput, "Error starting container %s: %v\n", containerId, err)
+		return
+	}
+
+	fmt.Fprintf(controller.DebugOutput, "Container %s started successfully.\n", containerId)
 }
 
 func (controller *AppController) feedLogForContainer() {
@@ -77,6 +143,14 @@ func (controller *AppController) feedLogForContainer() {
 		cancel()
 		return
 	}
+
+	// Scroll to the end of the logs view after a blink
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		controller.app.QueueUpdateDraw(func() {
+			controller.ServiceLogsView.ScrollToEnd()
+		})
+	}()
 
 	for scanner.Scan() {
 		text := scanner.Text()
@@ -195,6 +269,21 @@ func (controller *AppController) getServiceListView() {
 		controller.app.SetFocus(controller.ServiceLogsView)
 
 		currentLogsStream.ContainerID = containerID
+	})
+
+	serviceTreeView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		currentLogsStream.ContainerID = controller.ServiceStatusView.GetCurrentNode().GetReference().(string)
+		switch event.Rune() {
+		case 'r', 'R':
+			controller.restartContainer()
+		case 's', 'S':
+			controller.stopContainer()
+		case 'x', 'X':
+			controller.startContainer()
+		default:
+			return event
+		}
+		return event
 	})
 
 	controller.ServiceStatusView = serviceTreeView
@@ -345,6 +434,7 @@ func main() {
 
 	go controller.logContainerController()
 	go controller.updateServicesStatus(ctx)
+	go controller.setCurrentNodeOnNavigation()
 
 	controller.InitInterface()
 }
