@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -39,6 +38,17 @@ type LogsStream struct {
 var currentLogsStream *LogsStream = &LogsStream{}
 
 var containers = make(map[string]Container)
+
+func (controller *AppController) writeToDebug(text string) {
+	if controller.DebugOutput == nil {
+		return
+	}
+
+	controller.app.QueueUpdateDraw(func() {
+		fmt.Fprintln(controller.DebugOutput, text)
+		controller.DebugOutput.ScrollToEnd()
+	})
+}
 
 func (controller *AppController) setCurrentNodeOnNavigation() {
 	for {
@@ -76,13 +86,17 @@ func (controller *AppController) restartContainer() {
 		return
 	}
 
+	container := containers[containerId]
+	containerIdentifier := container.Project + "/" + container.Name
+
+	controller.writeToDebug("Restarting container " + containerIdentifier + "...")
 	err := controller.DockerClient.ContainerRestart(ctx, containerId, containertypes.StopOptions{})
 	if err != nil {
-		fmt.Fprintf(controller.DebugOutput, "Error restarting container %s: %v\n", containerId, err)
+		controller.writeToDebug("Error restarting container " + containerIdentifier + ": " + err.Error())
 		return
 	}
 
-	fmt.Fprintf(controller.DebugOutput, "Container %s restarted successfully.\n", containerId)
+	controller.writeToDebug("Container " + containerIdentifier + " restarted successfully.")
 }
 
 func (controller *AppController) stopContainer() {
@@ -93,13 +107,17 @@ func (controller *AppController) stopContainer() {
 		return
 	}
 
+	container := containers[containerId]
+	containerIdentifier := container.Project + "/" + container.Name
+
+	controller.writeToDebug("Stopping container " + containerIdentifier + "...")
 	err := controller.DockerClient.ContainerStop(ctx, containerId, containertypes.StopOptions{})
 	if err != nil {
-		fmt.Fprintf(controller.DebugOutput, "Error stopping container %s: %v\n", containerId, err)
+		controller.writeToDebug("Error stopping container " + containerIdentifier + ": " + err.Error())
 		return
 	}
 
-	fmt.Fprintf(controller.DebugOutput, "Container %s stopped successfully.\n", containerId)
+	controller.writeToDebug("Container " + containerIdentifier + " stopped successfully.")
 }
 
 func (controller *AppController) startContainer() {
@@ -110,13 +128,17 @@ func (controller *AppController) startContainer() {
 		return
 	}
 
+	container := containers[containerId]
+	containerIdentifier := container.Project + "/" + container.Name
+
+	controller.writeToDebug("Starting container " + containerIdentifier + "...")
 	err := controller.DockerClient.ContainerStart(ctx, containerId, containertypes.StartOptions{})
 	if err != nil {
-		fmt.Fprintf(controller.DebugOutput, "Error starting container %s: %v\n", containerId, err)
+		controller.writeToDebug("Error starting container " + containerIdentifier + ": " + err.Error())
 		return
 	}
 
-	fmt.Fprintf(controller.DebugOutput, "Container %s started successfully.\n", containerId)
+	controller.writeToDebug("Container " + containerIdentifier + " started successfully.")
 }
 
 func (controller *AppController) feedLogForContainer() {
@@ -129,7 +151,7 @@ func (controller *AppController) feedLogForContainer() {
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,  // Stream logs
-		Tail:       "400", // Tail the last 100 lines
+		Tail:       "200", // Tail the last 100 lines
 	})
 	defer cancel()
 
@@ -275,11 +297,11 @@ func (controller *AppController) getServiceListView() {
 		currentLogsStream.ContainerID = controller.ServiceStatusView.GetCurrentNode().GetReference().(string)
 		switch event.Rune() {
 		case 'r', 'R':
-			controller.restartContainer()
+			go controller.restartContainer()
 		case 's', 'S':
-			controller.stopContainer()
+			go controller.stopContainer()
 		case 'x', 'X':
-			controller.startContainer()
+			go controller.startContainer()
 		default:
 			return event
 		}
@@ -399,10 +421,10 @@ func (controller *AppController) InitInterface() {
 	horizontal_flex := tview.NewFlex().SetDirection(tview.FlexRow)
 	horizontal_flex.AddItem(controller.ServiceLogsView, 0, 6, false)
 
-	if slices.Contains(os.Environ(), "DEBUG=1") {
-		controller.DebugOutput = tview.NewTextView()
-		horizontal_flex.AddItem(controller.DebugOutput, 0, 1, false)
-	}
+	controller.DebugOutput = tview.NewTextView()
+	controller.DebugOutput.SetBorder(true).SetBorderColor(tcell.ColorYellow)
+	controller.DebugOutput.SetTitle("Debug Output").SetTitleColor(tcell.ColorYellow)
+	horizontal_flex.AddItem(controller.DebugOutput, 0, 1, false)
 
 	base_flex := tview.NewFlex()
 	base_flex.AddItem(left_box, 0, 25, true) // Left panel containing tree view
