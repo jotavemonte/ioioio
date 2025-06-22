@@ -186,7 +186,6 @@ func (controller *AppController) feedLogForContainer() {
 		}
 
 		controller.app.QueueUpdateDraw(func() {
-			fmt.Fprintln(controller.ServiceLogsView, "---------")
 			fmt.Fprintln(controller.ServiceLogsView, text)
 		})
 	}
@@ -416,7 +415,18 @@ func (controller *AppController) InitInterface() {
 	controller.selectFirstContainer()
 
 	left_box := tview.NewFlex().SetDirection(tview.FlexRow)
-	left_box.AddItem(controller.ServiceStatusView, 0, 1, true) // TreeView takes all the space
+	left_box.AddItem(controller.ServiceStatusView, 0, 8, true) // TreeView takes all the space
+	legend_view := tview.NewTextView()
+	legend_view.SetText(`🟢 - Running 🔴 - Exited
+🟡 - Paused  🟣 - Restarting
+🔵 - Created
+---
+On the left panel, press 'r' to restart, 's' to stop, 'x' to start a container.
+---
+On the right panel press 'g' to navigate to the top and 'G' to navigate to the bottom of the logs view.
+`)
+	legend_view.SetBorder(true).SetBorderColor(tcell.ColorLimeGreen)
+	legend_view.SetTitle("Legend").SetTitleColor(tcell.ColorLimeGreen)
 
 	horizontal_flex := tview.NewFlex().SetDirection(tview.FlexRow)
 	horizontal_flex.AddItem(controller.ServiceLogsView, 0, 6, false)
@@ -424,7 +434,11 @@ func (controller *AppController) InitInterface() {
 	controller.DebugOutput = tview.NewTextView()
 	controller.DebugOutput.SetBorder(true).SetBorderColor(tcell.ColorYellow)
 	controller.DebugOutput.SetTitle("Debug Output").SetTitleColor(tcell.ColorYellow)
-	horizontal_flex.AddItem(controller.DebugOutput, 0, 1, false)
+	bottomFlex := tview.NewFlex().SetDirection(tview.FlexColumn)
+	bottomFlex.AddItem(controller.DebugOutput, 0, 1, false)
+	bottomFlex.AddItem(legend_view, 50, 0, false)
+
+	horizontal_flex.AddItem(bottomFlex, 13, 0, false) // Add the bottom flex containing debug output and legend
 
 	base_flex := tview.NewFlex()
 	base_flex.AddItem(left_box, 0, 25, true) // Left panel containing tree view
