@@ -53,7 +53,9 @@ func (controller *AppController) writeToDebug(text string) {
 }
 
 func (controller *AppController) setCurrentNodeOnNavigation() {
-	for {
+	ticker := time.NewTicker(35 * time.Millisecond)
+
+	for range ticker.C {
 		if controller.ServiceStatusView == nil {
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -69,15 +71,15 @@ func (controller *AppController) setCurrentNodeOnNavigation() {
 
 func (controller *AppController) logContainerController() {
 	currentContainerId := currentLogsStream.ContainerID
+	ticker := time.NewTicker(35 * time.Millisecond)
 
-	for {
+	for range ticker.C {
 		if currentContainerId != currentLogsStream.ContainerID {
 			currentContainerId = currentLogsStream.ContainerID
 			controller.ServiceLogsView.Clear()
 			go controller.feedLogForContainer()
 		}
 	}
-
 }
 
 func (controller *AppController) restartContainer() {
@@ -152,10 +154,9 @@ func (controller *AppController) feedLogForContainer() {
 	reader, err := controller.DockerClient.ContainerLogs(ctx, currentLogsStream.ContainerID, containertypes.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
-		Follow:     true,  // Stream logs
-		Tail:       "200", // Tail the last 100 lines
+		Follow:     true, // Stream logs
+		Tail:       "200",
 	})
-	defer cancel()
 
 	if err != nil {
 		cancel()
@@ -180,24 +181,28 @@ func (controller *AppController) feedLogForContainer() {
 	go func() {
 		scanner := bufio.NewScanner(pipeReader)
 		for scanner.Scan() {
-			text := scanner.Text()
-			if currentContainerId != currentLogsStream.ContainerID {
-				ctx.Done()
+			select {
+			case <-ctx.Done():
 				return
-			}
+			default:
+				text := scanner.Text()
+				if currentContainerId != currentLogsStream.ContainerID {
+					return
+				}
 
-			if strings.TrimSpace(text) == "" {
-				ctx.Done()
-				continue
-			}
+				if strings.TrimSpace(text) == "" {
+					continue
+				}
 
-			controller.app.QueueUpdateDraw(func() {
-				fmt.Fprintln(controller.ServiceLogsView, tview.TranslateANSI(text))
-			})
+				controller.app.QueueUpdateDraw(func() {
+					fmt.Fprintln(controller.ServiceLogsView, tview.TranslateANSI(text))
+				})
+			}
 		}
 	}()
 
 	stdcopy.StdCopy(pipeWriter, pipeWriter, reader)
+	cancel()
 }
 
 func (controller *AppController) getServiceStatus() {
@@ -362,64 +367,59 @@ func (controller *AppController) getServiceLogsView() {
 	controller.ServiceLogsView = logs_view
 }
 
-func (controller *AppController) updateServicesStatus(ctx context.Context) {
+func (controller *AppController) updateServicesStatus() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			oldContainers := make(map[string]Container)
-			for k, v := range containers {
-				vCopy := Container{
-					ID:      strings.Clone(v.ID),
-					Name:    strings.Clone(v.Name),
-					Project: strings.Clone(v.Project),
-					State:   strings.Clone(v.State),
-				}
-				oldContainers[strings.Clone(k)] = vCopy
+	for range ticker.C {
+		oldContainers := make(map[string]Container)
+		for k, v := range containers {
+			vCopy := Container{
+				ID:      strings.Clone(v.ID),
+				Name:    strings.Clone(v.Name),
+				Project: strings.Clone(v.Project),
+				State:   strings.Clone(v.State),
+			}
+			oldContainers[strings.Clone(k)] = vCopy
+		}
+
+		controller.getServiceStatus()
+
+		containersToUpdate := []string{}
+		for k, v := range oldContainers {
+			if containers[k].State != v.State {
+				containersToUpdate = append(containersToUpdate, k)
+			}
+		}
+		serviceNodes := make(map[string]*tview.TreeNode)
+		for _, node := range controller.ServiceStatusView.GetRoot().GetChildren() {
+			serviceNodes[node.GetText()] = node
+		}
+
+		for _, containerID := range containersToUpdate {
+			container := containers[containerID]
+			projectNode, ok := serviceNodes[container.Project]
+			if !ok {
+				continue // Project node not found
 			}
 
-			controller.getServiceStatus()
-
-			containersToUpdate := []string{}
-			for k, v := range oldContainers {
-				if containers[k].State != v.State {
-					containersToUpdate = append(containersToUpdate, k)
+			var containerNode *tview.TreeNode
+			for _, child := range projectNode.GetChildren() {
+				if child.GetReference() == container.ID {
+					containerNode = child
+					break
 				}
 			}
-			serviceNodes := make(map[string]*tview.TreeNode)
-			for _, node := range controller.ServiceStatusView.GetRoot().GetChildren() {
-				serviceNodes[node.GetText()] = node
+
+			if containerNode == nil {
+				continue // Container node not found
 			}
 
-			for _, containerID := range containersToUpdate {
-				container := containers[containerID]
-				projectNode, ok := serviceNodes[container.Project]
-				if !ok {
-					continue // Project node not found
-				}
+			containerText := buildContainerText(container)
 
-				var containerNode *tview.TreeNode
-				for _, child := range projectNode.GetChildren() {
-					if child.GetReference() == container.ID {
-						containerNode = child
-						break
-					}
-				}
-
-				if containerNode == nil {
-					continue // Container node not found
-				}
-
-				containerText := buildContainerText(container)
-
-				controller.app.QueueUpdateDraw(func() {
-					containerNode.SetText(containerText)
-				})
-			}
+			controller.app.QueueUpdateDraw(func() {
+				containerNode.SetText(containerText)
+			})
 		}
 	}
 }
@@ -481,14 +481,11 @@ func (controller *AppController) InitDockerCLI() {
 func main() {
 	var controller AppController
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	controller.InitDockerCLI()
 	defer controller.DockerClient.Close()
 
 	go controller.logContainerController()
-	go controller.updateServicesStatus(ctx)
+	go controller.updateServicesStatus()
 	go controller.setCurrentNodeOnNavigation()
 
 	controller.InitInterface()
