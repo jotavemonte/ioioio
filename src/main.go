@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -156,10 +158,11 @@ func (controller *AppController) feedLogForContainer() {
 	defer cancel()
 
 	if err != nil {
+		cancel()
 		return
 	}
 
-	scanner := bufio.NewScanner(reader)
+	pipeReader, pipeWriter := io.Pipe()
 
 	if controller.ServiceLogsView == nil {
 		cancel()
@@ -174,21 +177,27 @@ func (controller *AppController) feedLogForContainer() {
 		})
 	}()
 
-	for scanner.Scan() {
-		text := scanner.Text()
-		if currentContainerId != currentLogsStream.ContainerID {
-			ctx.Done()
-			return
-		}
+	go func() {
+		scanner := bufio.NewScanner(pipeReader)
+		for scanner.Scan() {
+			text := scanner.Text()
+			if currentContainerId != currentLogsStream.ContainerID {
+				ctx.Done()
+				return
+			}
 
-		if strings.TrimSpace(text) == "" {
-			continue
-		}
+			if strings.TrimSpace(text) == "" {
+				ctx.Done()
+				continue
+			}
 
-		controller.app.QueueUpdateDraw(func() {
-			fmt.Fprintln(controller.ServiceLogsView, text)
-		})
-	}
+			controller.app.QueueUpdateDraw(func() {
+				fmt.Fprintln(controller.ServiceLogsView, tview.TranslateANSI(text))
+			})
+		}
+	}()
+
+	stdcopy.StdCopy(pipeWriter, pipeWriter, reader)
 }
 
 func (controller *AppController) getServiceStatus() {
@@ -226,7 +235,13 @@ func (controller *AppController) getServiceStatus() {
 }
 
 func (controller *AppController) selectFirstContainer() {
-	// Implement the function logic or leave it empty for now
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Fprint(os.Stderr, "No containers found. Please ensure Docker is running and you have containers available.\n")
+			os.Exit(1)
+		}
+	}()
+
 	fistContainer := controller.ServiceStatusView.GetRoot().GetChildren()[0].GetChildren()[0]
 
 	controller.ServiceStatusView.SetCurrentNode(fistContainer)
@@ -287,8 +302,6 @@ func (controller *AppController) getServiceListView() {
 			return
 		}
 
-		controller.app.SetFocus(controller.ServiceLogsView)
-
 		currentLogsStream.ContainerID = containerID
 	})
 
@@ -302,7 +315,12 @@ func (controller *AppController) getServiceListView() {
 		case 'x', 'X':
 			go controller.startContainer()
 		default:
-			return event
+			switch event.Key() {
+			case tcell.KeyEnter:
+				controller.app.SetFocus(controller.ServiceLogsView)
+			default:
+				return event
+			}
 		}
 		return event
 	})
@@ -324,7 +342,8 @@ func buildContainerText(container Container) string {
 func (controller *AppController) getServiceLogsView() {
 
 	logs_view := tview.NewTextView()
-
+	logs_view.SetDynamicColors(true)
+	logs_view.SetRegions(true)
 	logs_view.SetBorder(true)
 	logs_view.SetTitle("Logs")
 	logs_view.SetTitleColor(tcell.ColorLimeGreen)
