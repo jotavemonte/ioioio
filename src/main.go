@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"sort"
 	"strings"
@@ -30,6 +28,8 @@ type AppController struct {
 	DockerClient      *client.Client
 	DebugOutput       *tview.TextView
 	app               *tview.Application
+	stopLogs          chan bool
+	startLogs         chan bool
 }
 
 type LogsStream struct {
@@ -52,33 +52,25 @@ func (controller *AppController) writeToDebug(text string) {
 	})
 }
 
-func (controller *AppController) setCurrentNodeOnNavigation() {
-	ticker := time.NewTicker(35 * time.Millisecond)
+func (controller *AppController) initLogs() {
+	controller.startLogs <- true
+}
 
-	for range ticker.C {
-		if controller.ServiceStatusView == nil {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		containerId := currentLogsStream.ContainerID
-		currentContainerId := controller.ServiceStatusView.GetCurrentNode().GetReference().(string)
-
-		if containerId != currentContainerId {
-			currentLogsStream.ContainerID = currentContainerId
-		}
-	}
+func (controller *AppController) refreshContainerState() {
+	controller.stopLogs <- true
+	controller.startLogs <- true
 }
 
 func (controller *AppController) logContainerController() {
-	currentContainerId := currentLogsStream.ContainerID
-	ticker := time.NewTicker(35 * time.Millisecond)
-
-	for range ticker.C {
-		if currentContainerId != currentLogsStream.ContainerID {
-			currentContainerId = currentLogsStream.ContainerID
-			controller.ServiceLogsView.Clear()
-			go controller.feedLogForContainer()
+	for {
+		if controller.ServiceLogsView != nil {
+			break
 		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	for {
+		<-controller.startLogs
+		go controller.feedLogForContainer()
 	}
 }
 
@@ -99,7 +91,7 @@ func (controller *AppController) restartContainer() {
 		controller.writeToDebug("Error restarting container " + containerIdentifier + ": " + err.Error())
 		return
 	}
-
+	go controller.refreshContainerState()
 	controller.writeToDebug("Container " + containerIdentifier + " restarted successfully.")
 }
 
@@ -121,6 +113,7 @@ func (controller *AppController) stopContainer() {
 		return
 	}
 
+	go controller.refreshContainerState()
 	controller.writeToDebug("Container " + containerIdentifier + " stopped successfully.")
 }
 
@@ -142,6 +135,7 @@ func (controller *AppController) startContainer() {
 		return
 	}
 
+	go controller.refreshContainerState()
 	controller.writeToDebug("Container " + containerIdentifier + " started successfully.")
 }
 
@@ -151,26 +145,29 @@ func (controller *AppController) feedLogForContainer() {
 	containerProject := containers[currentContainerId].Project
 	controller.ServiceLogsView.SetTitle("Logs - " + "(" + containerProject + "/" + containerName + ")")
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	reader, err := controller.DockerClient.ContainerLogs(ctx, currentLogsStream.ContainerID, containertypes.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true, // Stream logs
 		Tail:       "200",
 	})
-
 	if err != nil {
-		cancel()
 		return
 	}
+	defer reader.Close()
 
-	pipeReader, pipeWriter := io.Pipe()
+	w := tview.ANSIWriter(controller.ServiceLogsView)
 
 	if controller.ServiceLogsView == nil {
-		cancel()
 		return
 	}
 
-	// Scroll to the end of the logs view after a blink
+	go func() {
+		<-controller.stopLogs
+		cancel()
+	}()
+
 	go func() {
 		time.Sleep(200 * time.Millisecond)
 		controller.app.QueueUpdateDraw(func() {
@@ -178,30 +175,10 @@ func (controller *AppController) feedLogForContainer() {
 		})
 	}()
 
-	go func() {
-		scanner := bufio.NewScanner(pipeReader)
-		for scanner.Scan() {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				text := scanner.Text()
-				if currentContainerId != currentLogsStream.ContainerID {
-					return
-				}
-
-				if strings.TrimSpace(text) == "" {
-					continue
-				}
-
-				controller.app.QueueUpdateDraw(func() {
-					fmt.Fprintln(controller.ServiceLogsView, tview.TranslateANSI(text))
-				})
-			}
-		}
-	}()
-
-	stdcopy.StdCopy(pipeWriter, pipeWriter, reader)
+	controller.app.QueueUpdateDraw(func() {
+		controller.ServiceLogsView.Clear()
+	})
+	stdcopy.StdCopy(w, w, reader)
 	cancel()
 }
 
@@ -300,18 +277,7 @@ func (controller *AppController) getServiceListView() {
 		}
 	}
 
-	serviceTreeView.SetSelectedFunc(func(node *tview.TreeNode) {
-		containerID, ok := node.GetReference().(string)
-
-		if !ok {
-			return
-		}
-
-		currentLogsStream.ContainerID = containerID
-	})
-
 	serviceTreeView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		currentLogsStream.ContainerID = controller.ServiceStatusView.GetCurrentNode().GetReference().(string)
 		switch event.Rune() {
 		case 'r', 'R':
 			go controller.restartContainer()
@@ -330,16 +296,21 @@ func (controller *AppController) getServiceListView() {
 		return event
 	})
 
+	serviceTreeView.SetChangedFunc(func(node *tview.TreeNode) {
+		currentLogsStream.ContainerID = node.GetReference().(string)
+		go controller.refreshContainerState()
+	})
+
 	controller.ServiceStatusView = serviceTreeView
 }
 
 func buildContainerText(container Container) string {
 	statusEmojiMap := map[string]string{
-		"running":    "🟢",
-		"exited":     "🔴",
-		"paused":     "🟡",
+		"running":    "💚",
+		"exited":     "🛑",
+		"paused":     "🟨",
 		"restarting": "🟣",
-		"created":    "🔵",
+		"created":    "🔷",
 	}
 	return statusEmojiMap[container.State] + " " + container.Name
 }
@@ -354,6 +325,7 @@ func (controller *AppController) getServiceLogsView() {
 	logs_view.SetTitleColor(tcell.ColorLimeGreen)
 	logs_view.SetBorderColor(tcell.ColorLimeGreen)
 	logs_view.SetBackgroundColor(tcell.ColorBlack)
+	logs_view.SetScrollable(true)
 	logs_view.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEsc:
@@ -364,11 +336,14 @@ func (controller *AppController) getServiceLogsView() {
 			return event
 		}
 	})
+	logs_view.SetChangedFunc(func() {
+		controller.app.Draw()
+	})
 	controller.ServiceLogsView = logs_view
 }
 
 func (controller *AppController) updateServicesStatus() {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(1000 * time.Millisecond)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -436,9 +411,9 @@ func (controller *AppController) InitInterface() {
 	left_box := tview.NewFlex().SetDirection(tview.FlexRow)
 	left_box.AddItem(controller.ServiceStatusView, 0, 8, true) // TreeView takes all the space
 	legend_view := tview.NewTextView()
-	legend_view.SetText(`🟢 - Running 🔴 - Exited
-🟡 - Paused  🟣 - Restarting
-🔵 - Created
+	legend_view.SetText(`💚 - Running 🛑 - Exited
+🟨 - Paused  🟣 - Restarting
+🔷 - Created
 ---
 On the left panel, press 'r' to restart, 's' to stop, 'x' to start a container.
 ---
@@ -481,12 +456,14 @@ func (controller *AppController) InitDockerCLI() {
 func main() {
 	var controller AppController
 
+	controller.startLogs, controller.stopLogs = make(chan bool, 2), make(chan bool, 2)
+
 	controller.InitDockerCLI()
 	defer controller.DockerClient.Close()
 
 	go controller.logContainerController()
 	go controller.updateServicesStatus()
-	go controller.setCurrentNodeOnNavigation()
+	go controller.initLogs()
 
 	controller.InitInterface()
 }
