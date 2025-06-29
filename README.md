@@ -9,6 +9,7 @@ ioioio is a lightweight terminal-based Docker container monitoring tool that pro
 - **Live log streaming**: Watch container logs in real-time
 - **Container management**: Restart, stop, and start containers directly from the interface
 - **Visual status indicators**: Colorful status indicators (💚🛑🟨🟣🔷) show container states at a glance
+- **Display only containers for the projects that matter**: Filter projects using the command line `ioioio <project-1> <project-2>`
 
 ## Installation
 

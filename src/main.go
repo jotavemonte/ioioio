@@ -255,7 +255,25 @@ func (controller *AppController) getServiceListView() {
 	}
 	sort.Strings(projects)
 
-	for _, project := range projects {
+	argsProjects := os.Args[:]
+	argsProjectsMap := make(map[string]bool)
+
+	for _, arg := range argsProjects {
+		argsProjectsMap[arg] = true
+	}
+
+	filteredProjects := make([]string, 0, len(projects))
+	if len(argsProjects) > 1 {
+		for _, arg := range projects {
+			if exists, ok := argsProjectsMap[arg]; ok && exists {
+				filteredProjects = append(filteredProjects, arg)
+			}
+		}
+	} else {
+		filteredProjects = append(filteredProjects, projects...)
+	}
+
+	for _, project := range filteredProjects {
 		projectNode := tview.NewTreeNode(project).
 			SetColor(tcell.ColorBlue).
 			SetSelectable(false).
