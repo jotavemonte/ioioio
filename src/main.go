@@ -30,6 +30,8 @@ type AppController struct {
 	app               *tview.Application
 	stopLogs          chan bool
 	startLogs         chan bool
+	searchTerm        string
+	searchModal       *tview.InputField
 }
 
 type LogsStream struct {
@@ -143,7 +145,7 @@ func (controller *AppController) feedLogForContainer() {
 	currentContainerId := currentLogsStream.ContainerID
 	containerName := containers[currentContainerId].Name
 	containerProject := containers[currentContainerId].Project
-	controller.ServiceLogsView.SetTitle("Logs - " + "(" + containerProject + "/" + containerName + ")")
+	controller.ServiceLogsView.SetTitle("[2]Logs - " + "(" + containerProject + "/" + containerName + ")")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	reader, err := controller.DockerClient.ContainerLogs(ctx, currentLogsStream.ContainerID, containertypes.LogsOptions{
@@ -224,16 +226,35 @@ func (controller *AppController) selectFirstContainer() {
 		}
 	}()
 
-	fistContainer := controller.ServiceStatusView.GetRoot().GetChildren()[0].GetChildren()[0]
+	firstContainer := controller.ServiceStatusView.GetRoot().GetChildren()[0].GetChildren()[0]
 
-	controller.ServiceStatusView.SetCurrentNode(fistContainer)
+	controller.ServiceStatusView.SetCurrentNode(firstContainer)
+}
+
+func (controller *AppController) getAppView() {
+	controller.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyRune:
+			switch event.Rune() {
+			case '1':
+				controller.app.SetFocus(controller.ServiceStatusView)
+				return event
+			case '2':
+				controller.app.SetFocus(controller.ServiceLogsView)
+				return event
+			case '3':
+				controller.app.SetFocus(controller.DebugOutput)
+				return event
+			}
+		}
+		return event
+	})
 }
 
 func (controller *AppController) getServiceListView() {
-
 	serviceTreeView := tview.NewTreeView()
 	serviceTreeView.SetBorder(true)
-	serviceTreeView.SetTitle("Service Status")
+	serviceTreeView.SetTitle("[1]Service Status")
 	serviceTreeView.SetTitleColor(tcell.ColorLimeGreen)
 	serviceTreeView.SetBorderColor(tcell.ColorLimeGreen)
 	serviceTreeView.SetGraphics(true)
@@ -316,7 +337,6 @@ func buildContainerText(container Container) string {
 }
 
 func (controller *AppController) getServiceLogsView() {
-
 	logs_view := tview.NewTextView()
 	logs_view.SetDynamicColors(true)
 	logs_view.SetRegions(true)
@@ -331,6 +351,12 @@ func (controller *AppController) getServiceLogsView() {
 		case tcell.KeyEsc:
 			controller.app.GetFocus()
 			controller.app.SetFocus(controller.ServiceStatusView)
+			return event
+		case tcell.KeyRune:
+			switch event.Rune() {
+			case '/':
+				return event
+			}
 			return event
 		default:
 			return event
@@ -403,6 +429,7 @@ func (controller *AppController) InitInterface() {
 	app := tview.NewApplication()
 	controller.app = app
 
+	controller.getAppView()
 	controller.getServiceStatus()
 	controller.getServiceListView()
 	controller.getServiceLogsView()
@@ -427,7 +454,7 @@ On the right panel press 'g' to navigate to the top and 'G' to navigate to the b
 
 	controller.DebugOutput = tview.NewTextView()
 	controller.DebugOutput.SetBorder(true).SetBorderColor(tcell.ColorYellow)
-	controller.DebugOutput.SetTitle("Debug Output").SetTitleColor(tcell.ColorYellow)
+	controller.DebugOutput.SetTitle("[3]Debug Output").SetTitleColor(tcell.ColorYellow)
 	bottomFlex := tview.NewFlex().SetDirection(tview.FlexColumn)
 	bottomFlex.AddItem(controller.DebugOutput, 0, 1, false)
 	bottomFlex.AddItem(legend_view, 50, 0, false)
