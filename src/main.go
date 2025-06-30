@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"github.com/sahilm/fuzzy"
 )
 
 type Container struct {
@@ -25,13 +27,19 @@ type Container struct {
 type AppController struct {
 	ServiceStatusView *tview.TreeView
 	ServiceLogsView   *tview.TextView
+	ServiceLogsLayout tview.Primitive
 	DockerClient      *client.Client
 	DebugOutput       *tview.TextView
+	ConfiguraitonView *tview.TextView
+	HelpView          *tview.TextView
+	PagesHub          *tview.Pages
+	ButtonsView       *tview.Flex
 	app               *tview.Application
 	stopLogs          chan bool
 	startLogs         chan bool
-	searchTerm        string
-	searchModal       *tview.InputField
+	SearchInput       *tview.InputField
+	LogBuffer         []string
+	isSearching       bool
 }
 
 type LogsStream struct {
@@ -49,7 +57,7 @@ func (controller *AppController) writeToDebug(text string) {
 	}
 
 	controller.app.QueueUpdateDraw(func() {
-		fmt.Fprintln(controller.DebugOutput, text)
+		fmt.Fprintln(controller.DebugOutput, fmt.Sprint("• ", text))
 		controller.DebugOutput.ScrollToEnd()
 	})
 }
@@ -170,11 +178,20 @@ func (controller *AppController) feedLogForContainer() {
 		cancel()
 	}()
 
+	scanner := bufio.NewScanner(reader)
 	go func() {
-		time.Sleep(200 * time.Millisecond)
-		controller.app.QueueUpdateDraw(func() {
-			controller.ServiceLogsView.ScrollToEnd()
-		})
+		for scanner.Scan() {
+			line := scanner.Text()
+			controller.LogBuffer = append(controller.LogBuffer, line)
+
+			if !controller.isSearching {
+				// Write directly to view and scroll
+				controller.app.QueueUpdateDraw(func() {
+					fmt.Fprintln(w, line)
+					controller.ServiceLogsView.ScrollToEnd()
+				})
+			}
+		}
 	}()
 
 	controller.app.QueueUpdateDraw(func() {
@@ -251,6 +268,50 @@ func (controller *AppController) getAppView() {
 	})
 }
 
+func (controller *AppController) getHelpView() {
+	helpView := tview.NewTextView()
+	helpView.SetDynamicColors(true)
+	helpView.SetRegions(true)
+	helpView.SetBorder(true)
+	helpView.SetTitle("Help")
+	helpView.SetTitleColor(tcell.ColorLimeGreen)
+	helpView.SetBorderColor(tcell.ColorLimeGreen)
+	helpView.SetBackgroundColor(tcell.ColorBlack)
+	helpView.SetScrollable(true)
+
+	helpText := `Container Statuses:
+---
+• 💚 - Running
+
+• 🛑 - Exited
+
+• 🟨 - Paused
+
+• 🟣 - Restarting
+
+• 🔷 - Created
+
+Commands:
+---
+Global:
+• Ctrl + A - Toggle logs view
+• Ctrl + S - Toggle configuration view
+• ? - Toggle help view
+• g - Go to top of logs
+• G - Go to bottom of logs
+• x - Start selected container
+• r - Restart selected container
+• s - Stop selected container
+
+Navigation:
+• On the left pannel, use arrow keys or the mouse to navigate through services.
+• On the left pannel, press enter to navigate to the main view.
+• On the main view, press esc to return to the service list.`
+	helpView.SetText(helpText)
+	controller.HelpView = helpView
+	controller.PagesHub.AddPage("help", helpView, true, false)
+}
+
 func (controller *AppController) getServiceListView() {
 	serviceTreeView := tview.NewTreeView()
 	serviceTreeView.SetBorder(true)
@@ -276,7 +337,25 @@ func (controller *AppController) getServiceListView() {
 	}
 	sort.Strings(projects)
 
-	for _, project := range projects {
+	argsProjects := os.Args[:]
+	argsProjectsMap := make(map[string]bool)
+
+	for _, arg := range argsProjects {
+		argsProjectsMap[arg] = true
+	}
+
+	filteredProjects := make([]string, 0, len(projects))
+	if len(argsProjects) > 1 {
+		for _, arg := range projects {
+			if exists, ok := argsProjectsMap[arg]; ok && exists {
+				filteredProjects = append(filteredProjects, arg)
+			}
+		}
+	} else {
+		filteredProjects = append(filteredProjects, projects...)
+	}
+
+	for _, project := range filteredProjects {
 		projectNode := tview.NewTreeNode(project).
 			SetColor(tcell.ColorBlue).
 			SetSelectable(false).
@@ -299,20 +378,11 @@ func (controller *AppController) getServiceListView() {
 	}
 
 	serviceTreeView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		switch event.Rune() {
-		case 'r', 'R':
-			go controller.restartContainer()
-		case 's', 'S':
-			go controller.stopContainer()
-		case 'x', 'X':
-			go controller.startContainer()
+		switch event.Key() {
+		case tcell.KeyEnter:
+			controller.app.SetFocus(controller.PagesHub)
 		default:
-			switch event.Key() {
-			case tcell.KeyEnter:
-				controller.app.SetFocus(controller.ServiceLogsView)
-			default:
-				return event
-			}
+			return event
 		}
 		return event
 	})
@@ -320,6 +390,7 @@ func (controller *AppController) getServiceListView() {
 	serviceTreeView.SetChangedFunc(func(node *tview.TreeNode) {
 		currentLogsStream.ContainerID = node.GetReference().(string)
 		go controller.refreshContainerState()
+		go controller.updateConfigView()
 	})
 
 	controller.ServiceStatusView = serviceTreeView
@@ -346,6 +417,42 @@ func (controller *AppController) getServiceLogsView() {
 	logs_view.SetBorderColor(tcell.ColorLimeGreen)
 	logs_view.SetBackgroundColor(tcell.ColorBlack)
 	logs_view.SetScrollable(true)
+
+	searchInput := tview.NewInputField().
+		SetLabel("Search: ").
+		SetFieldWidth(30).
+		SetFieldBackgroundColor(tcell.ColorDarkSlateGray).
+		SetLabelColor(tcell.ColorAqua)
+
+	controller.SearchInput = searchInput
+
+	searchInput.SetChangedFunc(func(text string) {
+		if text == "" {
+			for _, line := range controller.LogBuffer {
+				logs_view.Write([]byte(line + "\n"))
+			}
+			return
+		}
+		matches := fuzzy.Find(text, controller.LogBuffer)
+		for _, match := range matches {
+			fmt.Fprint(logs_view, "[yellow]"+match.Str+"[white]\n", match.Str)
+		}
+	})
+
+	// When searchInput loses focus (doneFunc), clear search and resume streaming:
+	searchInput.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter || key == tcell.KeyEsc {
+			controller.isSearching = false
+			searchInput.SetText("")
+			// Refill logsView with all buffered logs:
+			logs_view.Clear()
+			for _, line := range controller.LogBuffer {
+				fmt.Fprintln(logs_view, line)
+			}
+			controller.app.SetFocus(controller.ServiceLogsView)
+		}
+	})
+
 	logs_view.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEsc:
@@ -355,6 +462,8 @@ func (controller *AppController) getServiceLogsView() {
 		case tcell.KeyRune:
 			switch event.Rune() {
 			case '/':
+				searchInput.SetText("")
+				controller.app.SetFocus(searchInput)
 				return event
 			}
 			return event
@@ -362,10 +471,19 @@ func (controller *AppController) getServiceLogsView() {
 			return event
 		}
 	})
+
 	logs_view.SetChangedFunc(func() {
 		controller.app.Draw()
 	})
+
+	logsLayout := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(searchInput, 1, 0, false).
+		AddItem(logs_view, 0, 1, true)
+
 	controller.ServiceLogsView = logs_view
+	controller.ServiceLogsLayout = logsLayout
+
+	controller.PagesHub.AddPage("logs", controller.ServiceLogsLayout, true, true)
 }
 
 func (controller *AppController) updateServicesStatus() {
@@ -430,44 +548,183 @@ func (controller *AppController) InitInterface() {
 	controller.app = app
 
 	controller.getAppView()
+	controller.PagesHub = tview.NewPages()
+	controller.PagesHub.SetBackgroundColor(tcell.ColorBlack)
+	controller.PagesHub.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			controller.app.GetFocus()
+			controller.app.SetFocus(controller.ServiceStatusView)
+			return event
+		}
+		return event
+	})
+
 	controller.getServiceStatus()
 	controller.getServiceListView()
 	controller.getServiceLogsView()
+	controller.getServiceConfigurationView()
 	controller.selectFirstContainer()
+	controller.getButtonsView()
+	controller.getHelpView()
 
 	left_box := tview.NewFlex().SetDirection(tview.FlexRow)
 	left_box.AddItem(controller.ServiceStatusView, 0, 8, true) // TreeView takes all the space
-	legend_view := tview.NewTextView()
-	legend_view.SetText(`💚 - Running 🛑 - Exited
-🟨 - Paused  🟣 - Restarting
-🔷 - Created
----
-On the left panel, press 'r' to restart, 's' to stop, 'x' to start a container.
----
-On the right panel press 'g' to navigate to the top and 'G' to navigate to the bottom of the logs view.
-`)
-	legend_view.SetBorder(true).SetBorderColor(tcell.ColorLimeGreen)
-	legend_view.SetTitle("Legend").SetTitleColor(tcell.ColorLimeGreen)
 
-	horizontal_flex := tview.NewFlex().SetDirection(tview.FlexRow)
-	horizontal_flex.AddItem(controller.ServiceLogsView, 0, 6, false)
+	horizontalFlex := tview.NewFlex().SetDirection(tview.FlexRow)
+	horizontalFlex.SetBackgroundColor(tcell.ColorBlack)
+	horizontalFlex.AddItem(controller.ButtonsView, 3, 0, false) // Add buttons view at the top
+	horizontalFlex.AddItem(controller.PagesHub, 0, 6, false)
 
 	controller.DebugOutput = tview.NewTextView()
-	controller.DebugOutput.SetBorder(true).SetBorderColor(tcell.ColorYellow)
-	controller.DebugOutput.SetTitle("[3]Debug Output").SetTitleColor(tcell.ColorYellow)
-	bottomFlex := tview.NewFlex().SetDirection(tview.FlexColumn)
-	bottomFlex.AddItem(controller.DebugOutput, 0, 1, false)
-	bottomFlex.AddItem(legend_view, 50, 0, false)
+	controller.DebugOutput.SetBorder(true).SetBorderColor(tcell.ColorDarkOliveGreen)
+	controller.DebugOutput.SetTitle("Debug Output").SetTitleColor(tcell.ColorDarkOliveGreen)
+	horizontalFlex.AddItem(controller.DebugOutput, 10, 0, false) // Add the bottom flex containing debug output and legend
 
-	horizontal_flex.AddItem(bottomFlex, 13, 0, false) // Add the bottom flex containing debug output and legend
+	baseFlex := tview.NewFlex()
+	baseFlex.SetBackgroundColor(tcell.ColorBlack)
+	baseFlex.AddItem(left_box, 0, 25, true) // Left panel containing tree view
+	baseFlex.AddItem(horizontalFlex, 0, 75, false)
 
-	base_flex := tview.NewFlex()
-	base_flex.AddItem(left_box, 0, 25, true) // Left panel containing tree view
-	base_flex.AddItem(horizontal_flex, 0, 75, false)
+	controller.setGlobalCommands()
 
-	if err := controller.app.SetRoot(base_flex, true).EnableMouse(true).Run(); err != nil {
+	if err := controller.app.SetRoot(baseFlex, true).EnableMouse(true).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Application error: %v\n", err)
 	}
+}
+
+func (controller *AppController) getButtonsView() {
+	buttonsView := tview.NewFlex().SetDirection(tview.FlexColumn)
+	logsButton := tview.NewButton("<c-A> Logs").
+		SetSelectedFunc(func() {
+			controller.PagesHub.SwitchToPage("logs")
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				controller.app.SetFocus(controller.ServiceLogsView)
+			}()
+		}).
+		SetLabelColor(tcell.ColorLimeGreen)
+	logsButton.SetBorder(true)
+	logsButton.SetBackgroundColorActivated(tcell.ColorBlack)
+	logsButton.SetStyle(tcell.StyleDefault.Background(tcell.ColorBlack))
+	logsButton.SetBorderColor(tcell.ColorLimeGreen)
+	configButton := tview.NewButton("<c-S> Config").
+		SetSelectedFunc(func() {
+			controller.PagesHub.SwitchToPage("config")
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				controller.app.SetFocus(controller.ConfiguraitonView)
+			}()
+		}).
+		SetLabelColor(tcell.ColorLimeGreen)
+	configButton.SetBorder(true)
+	configButton.SetBackgroundColorActivated(tcell.ColorBlack)
+	configButton.SetStyle(tcell.StyleDefault.Background(tcell.ColorBlack))
+	configButton.SetBorderColor(tcell.ColorLimeGreen)
+
+	helpButton := tview.NewButton("<?> Help").
+		SetSelectedFunc(func() {
+			controller.PagesHub.SwitchToPage("help")
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				controller.app.SetFocus(controller.ConfiguraitonView)
+			}()
+		}).
+		SetLabelColor(tcell.ColorLimeGreen)
+	helpButton.SetBorder(true)
+	helpButton.SetBackgroundColorActivated(tcell.ColorBlack)
+	helpButton.SetStyle(tcell.StyleDefault.Background(tcell.ColorBlack))
+	helpButton.SetBorderColor(tcell.ColorLimeGreen)
+
+	buttonsView.AddItem(logsButton, 15, 0, false).
+		AddItem(configButton, 15, 0, false).
+		AddItem(helpButton, 15, 0, false).
+		AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorBlack), 0, 1, false)
+	buttonsView.SetBackgroundColor(tcell.ColorBlack)
+	controller.ButtonsView = buttonsView
+}
+
+func (controller *AppController) updateConfigView() {
+	resp, err := controller.DockerClient.ContainerInspect(context.Background(), currentLogsStream.ContainerID)
+	if err != nil {
+		controller.writeToDebug("Error inspecting container: " + err.Error())
+		return
+	}
+
+	var builder strings.Builder
+
+	containerName := containers[currentLogsStream.ContainerID].Name
+	containerProject := containers[currentLogsStream.ContainerID].Project
+
+	builder.WriteString(fmt.Sprintf("Container: %s/%s\n\n", containerProject, containerName))
+
+	builder.WriteString("Configuration Details:\n")
+	builder.WriteString("---------------------\n")
+	builder.WriteString(fmt.Sprintf("Hostname: %s\n", resp.Config.Hostname))
+	builder.WriteString(fmt.Sprintf("Domainname: %s\n", resp.Config.Domainname))
+	builder.WriteString(fmt.Sprintf("User: %s\n", resp.Config.User))
+	builder.WriteString(fmt.Sprintf("AttachStdin: %t\n", resp.Config.AttachStdin))
+	builder.WriteString(fmt.Sprintf("AttachStdout: %t\n", resp.Config.AttachStdout))
+	builder.WriteString(fmt.Sprintf("AttachStderr: %t\n", resp.Config.AttachStderr))
+	builder.WriteString(fmt.Sprintf("ExposedPorts: %v\n", resp.Config.ExposedPorts))
+	builder.WriteString(fmt.Sprintf("Tty: %t\n", resp.Config.Tty))
+	builder.WriteString(fmt.Sprintf("OpenStdin: %t\n", resp.Config.OpenStdin))
+	builder.WriteString(fmt.Sprintf("StdinOnce: %t\n", resp.Config.StdinOnce))
+
+	builder.WriteString(fmt.Sprintf("Image: %s\n", resp.Config.Image))
+	builder.WriteString(fmt.Sprintf("Entrypoint: %v\n", resp.Config.Entrypoint))
+	builder.WriteString(fmt.Sprintf("Cmd: %v\n", resp.Config.Cmd))
+	builder.WriteString(fmt.Sprintf("WorkingDir: %s\n", resp.Config.WorkingDir))
+
+	builder.WriteString("\nEnvironment Variables:\n")
+	envVars := resp.Config.Env
+	sort.Strings(envVars)
+	for _, value := range envVars {
+		builder.WriteString(fmt.Sprintf("• %s\n", value))
+	}
+
+	builder.WriteString("\nLabels:\n")
+	labels := make([]string, 0, len(resp.Config.Labels))
+	for k, v := range resp.Config.Labels {
+		labels = append(labels, fmt.Sprintf("%s: %s", k, v))
+	}
+	sort.Strings(labels)
+	for _, label := range labels {
+		builder.WriteString(fmt.Sprintf("• %s\n", label))
+	}
+
+	builder.WriteString("\nVolumes:\n")
+	for vol := range resp.Config.Volumes {
+		builder.WriteString(fmt.Sprintf("• %s\n", vol))
+	}
+
+	controller.app.QueueUpdateDraw(func() {
+		controller.ConfiguraitonView.SetText(builder.String())
+		controller.ConfiguraitonView.ScrollToBeginning()
+	})
+}
+
+func (controller *AppController) getServiceConfigurationView() {
+	configView := tview.NewTextView()
+	configView.SetDynamicColors(true)
+	configView.SetRegions(true)
+	configView.SetBorder(true)
+	configView.SetTitle("Logs")
+	configView.SetTitleColor(tcell.ColorLimeGreen)
+	configView.SetBorderColor(tcell.ColorLimeGreen)
+	configView.SetBackgroundColor(tcell.ColorBlack)
+	configView.SetScrollable(true)
+	configView.SetTitle("Service Configuration")
+
+	// Placeholder for service configuration
+	configContent := "Service configuration will be displayed here.\n"
+	configContent += "This feature is not yet implemented."
+
+	configView.SetText(configContent)
+
+	controller.ConfiguraitonView = configView
+
+	controller.PagesHub.AddPage("config", controller.ConfiguraitonView, true, false)
 }
 
 func (controller *AppController) InitDockerCLI() {
@@ -478,6 +735,49 @@ func (controller *AppController) InitDockerCLI() {
 	}
 
 	controller.DockerClient = cli
+}
+
+func (controller *AppController) setGlobalCommands() {
+	controller.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if controller.SearchInput != nil && controller.SearchInput.HasFocus() {
+			// Skip global keybindings while typing in search
+			return event
+		}
+		switch event.Rune() {
+		case 'g':
+			controller.app.SetFocus(controller.ServiceLogsView)
+			controller.ServiceLogsView.ScrollToBeginning()
+		case 'G':
+			controller.app.SetFocus(controller.ServiceLogsView)
+			controller.ServiceLogsView.ScrollToEnd()
+		case 'r', 'R':
+			go controller.restartContainer()
+		case 's', 'S':
+			go controller.stopContainer()
+		case 'x', 'X':
+			go controller.startContainer()
+		case '?':
+			controller.PagesHub.SwitchToPage("help")
+		case '1':
+			controller.app.SetFocus(controller.ServiceStatusView)
+			return event
+		case '2':
+			controller.app.SetFocus(controller.ServiceLogsView)
+			return event
+		case '3':
+			controller.app.SetFocus(controller.DebugOutput)
+			return event
+		}
+
+		switch event.Key() {
+		case tcell.KeyCtrlA:
+			controller.PagesHub.SwitchToPage("logs")
+		case tcell.KeyCtrlS:
+			controller.PagesHub.SwitchToPage("config")
+
+		}
+		return event
+	})
 }
 
 func main() {

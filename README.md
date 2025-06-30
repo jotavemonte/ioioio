@@ -2,6 +2,23 @@
 
 ioioio is a lightweight terminal-based Docker container monitoring tool that provides a simple, intuitive interface for managing and monitoring Docker containers. It allows you to view container status, logs, and perform basic container operations all from a single terminal window.
 
+The project is heavily influenced by [lazydocker](https://github.com/jesseduffield/lazydocker) - it's not a fork.
+
+## 🚀 Elevator Pitch
+
+Imagine you're a fullstack developer working in a microservices-heavy environment. To run end-to-end tests locally, you need to spin up 7+ separate Docker Compose projects—each living in its own directory, each requiring its own terminal session, and each producing logs in its own scattered tab.
+
+Monitoring container statuses? That means jumping into each folder to run docker compose ps. Tail logs? Same story. It's a fragmented, repetitive, and distracting experience.
+
+ioioio changes that.
+It's a lightweight, centralized interface that lets you:
+
+- View the status of all your running containers in one place.
+- Easily access logs for any service.
+- Jump between projects and services without switching tabs or terminals.
+
+With ioioio, you can stay focused on what matters—developing and debugging, not wrangling sessions.
+
 ## Features
 
 - **Real-time container monitoring**: View the status of all your Docker containers with automatic updates
@@ -9,6 +26,7 @@ ioioio is a lightweight terminal-based Docker container monitoring tool that pro
 - **Live log streaming**: Watch container logs in real-time
 - **Container management**: Restart, stop, and start containers directly from the interface
 - **Visual status indicators**: Colorful status indicators (💚🛑🟨🟣🔷) show container states at a glance
+- **Display only containers for the projects that matter**: Filter projects using the command line `ioioio <project-1> <project-2>`
 
 ## Installation
 
@@ -33,36 +51,7 @@ Run the application:
 ./ioioio
 ```
 
-### Interface Navigation
-
-The interface is split into two main panels:
-
-1. **Left panel (Service Status)**: Displays all Docker containers grouped by project
-2. **Right panel (Logs)**: Shows logs for the selected container
-
-### Keyboard Controls
-
-#### In the Service Status panel (left):
-
-- Use arrow keys to navigate between containers
-- `r` - Restart the selected container
-- `s` - Stop the selected container
-- `x` - Start the selected container
-- `Enter` - View the logs of the selected container
-
-#### In the Logs panel (right):
-
-- `g` - Scroll to the top of the logs
-- `G` - Scroll to the bottom of the logs
-- `Esc` - Return focus to the Service Status panel
-
-## Status Indicators
-
-- 💚 - Container is running
-- 🛑 - Container is stopped/exited
-- 🟨 - Container is paused
-- 🟣 - Container is restarting
-- 🔷 - Container is created but not yet started
+For details on how to use it, press `?` with the app running to see the legend and the available shortcuts and navigation tips.
 
 ## License
 
