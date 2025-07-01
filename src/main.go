@@ -39,7 +39,7 @@ type AppController struct {
 	stopLogs          chan bool
 	startLogs         chan bool
 	SearchInput       *tview.InputField
-	LogBuffer         []string
+	LogBuffers        map[string][]string
 	isSearching       bool
 }
 
@@ -154,48 +154,49 @@ func (controller *AppController) feedLogForContainer() {
 	currentContainerId := currentLogsStream.ContainerID
 	containerName := containers[currentContainerId].Name
 	containerProject := containers[currentContainerId].Project
-
-	controller.ServiceLogsView.SetTitle("[2]Logs - (" + containerProject + "/" + containerName + ")")
-
+	controller.ServiceLogsView.SetTitle("[2]Logs - " + "(" + containerProject + "/" + containerName + ")")
 	ctx, cancel := context.WithCancel(context.Background())
+
 	defer cancel()
 
-	reader, err := controller.DockerClient.ContainerLogs(ctx, currentContainerId, containertypes.LogsOptions{
+	reader, err := controller.DockerClient.ContainerLogs(ctx, currentLogsStream.ContainerID, containertypes.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
-		Tail:       "200", // Initial logs
+		Tail:       "all", // or "200"
 	})
+
 	if err != nil {
 		return
 	}
+
 	defer reader.Close()
 
-	// Pipe stdcopy decoded output to a reader we can scan
-	pr, pw := io.Pipe()
+	if controller.ServiceLogsView == nil {
+		return
+	}
 
 	go func() {
-		defer pw.Close()
-		_, _ = stdcopy.StdCopy(pw, pw, reader) // Decode Docker stream into pipe
+		<-controller.stopLogs
+		cancel()
 	}()
 
-	w := tview.ANSIWriter(controller.ServiceLogsView)
+	pr, pw := io.Pipe()
+	go func() {
+		stdcopy.StdCopy(pw, pw, reader)
+		pw.Close()
+	}()
+
+	scanner := bufio.NewScanner(pr)
 
 	go func() {
-		scanner := bufio.NewScanner(pr)
 		for scanner.Scan() {
 			line := scanner.Text()
-
-			// Optional: Limit log buffer to avoid memory issues
-			const maxBuffer = 2000
-			if len(controller.LogBuffer) >= maxBuffer {
-				controller.LogBuffer = controller.LogBuffer[1:]
-			}
-			controller.LogBuffer = append(controller.LogBuffer, line)
-
-			if !controller.isSearching {
+			// Append to the correct buffer
+			controller.LogBuffers[currentContainerId] = append(controller.LogBuffers[currentContainerId], line)
+			if !controller.isSearching && currentLogsStream.ContainerID == currentContainerId {
 				controller.app.QueueUpdateDraw(func() {
-					fmt.Fprintln(w, line)
+					fmt.Fprintln(controller.ServiceLogsView, line)
 					controller.ServiceLogsView.ScrollToEnd()
 				})
 			}
@@ -204,6 +205,10 @@ func (controller *AppController) feedLogForContainer() {
 
 	controller.app.QueueUpdateDraw(func() {
 		controller.ServiceLogsView.Clear()
+		for _, line := range controller.LogBuffers[currentContainerId] {
+			fmt.Fprintln(controller.ServiceLogsView, line)
+		}
+		controller.ServiceLogsView.ScrollToEnd()
 	})
 }
 
@@ -377,6 +382,15 @@ func (controller *AppController) getServiceListView() {
 		currentLogsStream.ContainerID = node.GetReference().(string)
 		go controller.refreshContainerState()
 		go controller.updateConfigView()
+
+		// Load logs for the selected container
+		controller.app.QueueUpdateDraw(func() {
+			controller.ServiceLogsView.Clear()
+			for _, line := range controller.LogBuffers[currentLogsStream.ContainerID] {
+				fmt.Fprintln(controller.ServiceLogsView, line)
+			}
+			controller.ServiceLogsView.ScrollToEnd()
+		})
 	})
 
 	controller.ServiceStatusView = serviceTreeView
@@ -413,25 +427,23 @@ func (controller *AppController) getServiceLogsView() {
 	controller.SearchInput = searchInput
 
 	searchInput.SetChangedFunc(func(text string) {
-	logs_view.Clear()
+		logs_view.Clear()
 
-	if text == "" {
-		for _, line := range controller.LogBuffer {
-			fmt.Fprintln(logs_view, line)
+		if text == "" {
+			for _, line := range controller.LogBuffers[currentLogsStream.ContainerID] {
+				fmt.Fprintln(logs_view, line)
+			}
 		}
-	}
 
-	// Compile case-insensitive pattern (quote meta ensures user input is safe)
-	pattern, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(text))
+		pattern, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(text))
 		if err != nil {
-			// Fallback: just print everything if there's a regex error
-			for _, line := range controller.LogBuffer {
+			for _, line := range controller.LogBuffers[currentLogsStream.ContainerID] {
 				fmt.Fprintln(logs_view, line)
 			}
 			return
 		}
 
-		for _, line := range controller.LogBuffer {
+		for _, line := range controller.LogBuffers[currentLogsStream.ContainerID] {
 			if pattern.MatchString(line) {
 				highlighted := pattern.ReplaceAllStringFunc(line, func(m string) string {
 					return "[red]" + m + "[white]"
@@ -441,27 +453,46 @@ func (controller *AppController) getServiceLogsView() {
 		}
 	})
 
-	// When searchInput loses focus (doneFunc), clear search and resume streaming:
 	searchInput.SetDoneFunc(func(key tcell.Key) {
-	switch key {
-	case tcell.KeyEnter:
-		// Just exit focus, keep filtered view
-		controller.isSearching = false
-		logs_view.ScrollToEnd()
-		controller.app.SetFocus(controller.ServiceLogsView)
-
-	case tcell.KeyEsc:
-		// Clear search and restore full log buffer
-		controller.isSearching = false
-		searchInput.SetText("")
-		logs_view.Clear()
-		for _, line := range controller.LogBuffer {
-			fmt.Fprintln(logs_view, line)
+		switch key {
+		case tcell.KeyEnter:
+			// Keep filtered/highlighted view, move focus to logs
+			controller.isSearching = true
+			logs_view.Clear()
+			searchText := searchInput.GetText()
+			if searchText == "" {
+				for _, line := range controller.LogBuffers[currentLogsStream.ContainerID] {
+					fmt.Fprintln(logs_view, line)
+				}
+			} else {
+				pattern, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(searchText))
+				if err != nil {
+					for _, line := range controller.LogBuffers[currentLogsStream.ContainerID] {
+						fmt.Fprintln(logs_view, line)
+					}
+				} else {
+					for _, line := range controller.LogBuffers[currentLogsStream.ContainerID] {
+						if pattern.MatchString(line) {
+							highlighted := pattern.ReplaceAllStringFunc(line, func(m string) string {
+								return "[red]" + m + "[white]"
+							})
+							fmt.Fprintln(logs_view, highlighted)
+						}
+					}
+				}
+			}
+			controller.app.SetFocus(controller.ServiceLogsView)
+		case tcell.KeyEsc:
+			// Clear search and restore full log buffer
+			controller.isSearching = false
+			searchInput.SetText("")
+			logs_view.Clear()
+			for _, line := range controller.LogBuffers[currentLogsStream.ContainerID] {
+				fmt.Fprintln(logs_view, line)
+			}
+			controller.app.SetFocus(controller.ServiceLogsView)
 		}
-		logs_view.ScrollToBeginning()
-		controller.app.SetFocus(controller.ServiceLogsView)
-	}
-})
+	})
 
 	logs_view.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -791,15 +822,16 @@ func (controller *AppController) setGlobalCommands() {
 
 func main() {
 	var controller AppController
-
+	controller.LogBuffers = make(map[string][]string)
 	controller.startLogs, controller.stopLogs = make(chan bool, 2), make(chan bool, 2)
 
 	controller.InitDockerCLI()
 	defer controller.DockerClient.Close()
 
+	controller.InitInterface()
+
 	go controller.logContainerController()
 	go controller.updateServicesStatus()
 	go controller.initLogs()
 
-	controller.InitInterface()
 }
