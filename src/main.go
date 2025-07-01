@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -14,7 +16,6 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
-	"github.com/sahilm/fuzzy"
 )
 
 type Container struct {
@@ -153,39 +154,46 @@ func (controller *AppController) feedLogForContainer() {
 	currentContainerId := currentLogsStream.ContainerID
 	containerName := containers[currentContainerId].Name
 	containerProject := containers[currentContainerId].Project
-	controller.ServiceLogsView.SetTitle("[2]Logs - " + "(" + containerProject + "/" + containerName + ")")
+
+	controller.ServiceLogsView.SetTitle("[2]Logs - (" + containerProject + "/" + containerName + ")")
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	reader, err := controller.DockerClient.ContainerLogs(ctx, currentLogsStream.ContainerID, containertypes.LogsOptions{
+
+	reader, err := controller.DockerClient.ContainerLogs(ctx, currentContainerId, containertypes.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
-		Follow:     true, // Stream logs
-		Tail:       "200",
+		Follow:     true,
+		Tail:       "200", // Initial logs
 	})
 	if err != nil {
 		return
 	}
 	defer reader.Close()
 
-	w := tview.ANSIWriter(controller.ServiceLogsView)
-
-	if controller.ServiceLogsView == nil {
-		return
-	}
+	// Pipe stdcopy decoded output to a reader we can scan
+	pr, pw := io.Pipe()
 
 	go func() {
-		<-controller.stopLogs
-		cancel()
+		defer pw.Close()
+		_, _ = stdcopy.StdCopy(pw, pw, reader) // Decode Docker stream into pipe
 	}()
 
-	scanner := bufio.NewScanner(reader)
+	w := tview.ANSIWriter(controller.ServiceLogsView)
+
 	go func() {
+		scanner := bufio.NewScanner(pr)
 		for scanner.Scan() {
 			line := scanner.Text()
+
+			// Optional: Limit log buffer to avoid memory issues
+			const maxBuffer = 2000
+			if len(controller.LogBuffer) >= maxBuffer {
+				controller.LogBuffer = controller.LogBuffer[1:]
+			}
 			controller.LogBuffer = append(controller.LogBuffer, line)
 
 			if !controller.isSearching {
-				// Write directly to view and scroll
 				controller.app.QueueUpdateDraw(func() {
 					fmt.Fprintln(w, line)
 					controller.ServiceLogsView.ScrollToEnd()
@@ -197,8 +205,6 @@ func (controller *AppController) feedLogForContainer() {
 	controller.app.QueueUpdateDraw(func() {
 		controller.ServiceLogsView.Clear()
 	})
-	stdcopy.StdCopy(w, w, reader)
-	cancel()
 }
 
 func (controller *AppController) getServiceStatus() {
@@ -246,26 +252,6 @@ func (controller *AppController) selectFirstContainer() {
 	firstContainer := controller.ServiceStatusView.GetRoot().GetChildren()[0].GetChildren()[0]
 
 	controller.ServiceStatusView.SetCurrentNode(firstContainer)
-}
-
-func (controller *AppController) getAppView() {
-	controller.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		switch event.Key() {
-		case tcell.KeyRune:
-			switch event.Rune() {
-			case '1':
-				controller.app.SetFocus(controller.ServiceStatusView)
-				return event
-			case '2':
-				controller.app.SetFocus(controller.ServiceLogsView)
-				return event
-			case '3':
-				controller.app.SetFocus(controller.DebugOutput)
-				return event
-			}
-		}
-		return event
-	})
 }
 
 func (controller *AppController) getHelpView() {
@@ -419,7 +405,7 @@ func (controller *AppController) getServiceLogsView() {
 	logs_view.SetScrollable(true)
 
 	searchInput := tview.NewInputField().
-		SetLabel("Search: ").
+		SetLabel("Search: [Press '/']").
 		SetFieldWidth(30).
 		SetFieldBackgroundColor(tcell.ColorDarkSlateGray).
 		SetLabelColor(tcell.ColorAqua)
@@ -427,31 +413,55 @@ func (controller *AppController) getServiceLogsView() {
 	controller.SearchInput = searchInput
 
 	searchInput.SetChangedFunc(func(text string) {
-		if text == "" {
+	logs_view.Clear()
+
+	if text == "" {
+		for _, line := range controller.LogBuffer {
+			fmt.Fprintln(logs_view, line)
+		}
+	}
+
+	// Compile case-insensitive pattern (quote meta ensures user input is safe)
+	pattern, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(text))
+		if err != nil {
+			// Fallback: just print everything if there's a regex error
 			for _, line := range controller.LogBuffer {
-				logs_view.Write([]byte(line + "\n"))
+				fmt.Fprintln(logs_view, line)
 			}
 			return
 		}
-		matches := fuzzy.Find(text, controller.LogBuffer)
-		for _, match := range matches {
-			fmt.Fprint(logs_view, "[yellow]"+match.Str+"[white]\n", match.Str)
+
+		for _, line := range controller.LogBuffer {
+			if pattern.MatchString(line) {
+				highlighted := pattern.ReplaceAllStringFunc(line, func(m string) string {
+					return "[red]" + m + "[white]"
+				})
+				fmt.Fprintln(logs_view, highlighted)
+			}
 		}
 	})
 
 	// When searchInput loses focus (doneFunc), clear search and resume streaming:
 	searchInput.SetDoneFunc(func(key tcell.Key) {
-		if key == tcell.KeyEnter || key == tcell.KeyEsc {
-			controller.isSearching = false
-			searchInput.SetText("")
-			// Refill logsView with all buffered logs:
-			logs_view.Clear()
-			for _, line := range controller.LogBuffer {
-				fmt.Fprintln(logs_view, line)
-			}
-			controller.app.SetFocus(controller.ServiceLogsView)
+	switch key {
+	case tcell.KeyEnter:
+		// Just exit focus, keep filtered view
+		controller.isSearching = false
+		logs_view.ScrollToEnd()
+		controller.app.SetFocus(controller.ServiceLogsView)
+
+	case tcell.KeyEsc:
+		// Clear search and restore full log buffer
+		controller.isSearching = false
+		searchInput.SetText("")
+		logs_view.Clear()
+		for _, line := range controller.LogBuffer {
+			fmt.Fprintln(logs_view, line)
 		}
-	})
+		logs_view.ScrollToBeginning()
+		controller.app.SetFocus(controller.ServiceLogsView)
+	}
+})
 
 	logs_view.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -547,7 +557,6 @@ func (controller *AppController) InitInterface() {
 	app := tview.NewApplication()
 	controller.app = app
 
-	controller.getAppView()
 	controller.PagesHub = tview.NewPages()
 	controller.PagesHub.SetBackgroundColor(tcell.ColorBlack)
 	controller.PagesHub.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
