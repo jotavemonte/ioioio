@@ -25,6 +25,7 @@ type Container struct {
 type AppController struct {
 	ServiceStatusView *tview.TreeView
 	ServiceLogsView   *tview.TextView
+	ServiceSearchView *tview.TextView
 	DockerClient      *client.Client
 	DebugOutput       *tview.TextView
 	ConfiguraitonView *tview.TextView
@@ -34,6 +35,7 @@ type AppController struct {
 	app               *tview.Application
 	stopLogs          chan bool
 	startLogs         chan bool
+	SearchInput       *tview.InputField
 }
 
 type LogsStream struct {
@@ -181,6 +183,56 @@ func (controller *AppController) feedLogForContainer() {
 
 	controller.app.QueueUpdateDraw(func() {
 		controller.ServiceLogsView.Clear()
+	})
+	stdcopy.StdCopy(w, w, reader)
+	cancel()
+}
+
+func (controller *AppController) feedLogsForSearch() {
+	if controller.ServiceSearchView == nil {
+		return
+	}
+
+	currentContainerId := currentLogsStream.ContainerID
+	container, ok := containers[currentContainerId]
+	if !ok {
+		return
+	}
+
+	controller.ServiceSearchView.SetTitle("Search - (" + container.Project + "/" + container.Name + ")")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader, err := controller.DockerClient.ContainerLogs(ctx, currentLogsStream.ContainerID, containertypes.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true, // Stream logs
+		Tail:       "200",
+	})
+	if err != nil {
+		return
+	}
+	defer reader.Close()
+
+	w := tview.ANSIWriter(controller.ServiceSearchView)
+
+	if controller.ServiceSearchView == nil {
+		return
+	}
+
+	go func() {
+		<-controller.stopLogs
+		cancel()
+	}()
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		controller.app.QueueUpdateDraw(func() {
+			controller.ServiceSearchView.ScrollToEnd()
+		})
+	}()
+
+	controller.app.QueueUpdateDraw(func() {
+		controller.ServiceSearchView.Clear()
 	})
 	stdcopy.StdCopy(w, w, reader)
 	cancel()
@@ -391,6 +443,24 @@ func (controller *AppController) getServiceLogsView() {
 	controller.PagesHub.AddPage("logs", controller.ServiceLogsView, true, true)
 }
 
+func (controller *AppController) getSearchLogsView() {
+	search_view := tview.NewTextView()
+	search_view.SetDynamicColors(true)
+	search_view.SetRegions(true)
+	search_view.SetBorder(true)
+	search_view.SetTitle("Search")
+	search_view.SetTitleColor(tcell.ColorPurple)
+	search_view.SetBorderColor(tcell.ColorPurple)
+	search_view.SetBackgroundColor(tcell.ColorBlack)
+	search_view.SetScrollable(true)
+	search_view.SetChangedFunc(func() {
+		controller.app.Draw()
+	})
+	controller.ServiceSearchView = search_view
+	controller.PagesHub.AddPage("search", controller.ServiceSearchView, true, true)
+	go controller.feedLogsForSearch()
+}
+
 func (controller *AppController) updateServicesStatus() {
 	ticker := time.NewTicker(1000 * time.Millisecond)
 	defer ticker.Stop()
@@ -540,10 +610,20 @@ func (controller *AppController) getButtonsView() {
 	helpButton.SetStyle(tcell.StyleDefault.Background(tcell.ColorBlack))
 	helpButton.SetBorderColor(tcell.ColorLimeGreen)
 
+	searchInput := tview.NewInputField().
+		SetLabel("Search: [Press '/']").
+		SetFieldWidth(30).
+		SetFieldBackgroundColor(tcell.ColorDarkSlateGray).
+		SetLabelColor(tcell.ColorAqua)
+
+	controller.SearchInput = searchInput
+
 	buttonsView.AddItem(logsButton, 15, 0, false).
 		AddItem(configButton, 15, 0, false).
 		AddItem(helpButton, 15, 0, false).
-		AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorBlack), 0, 1, false)
+		AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorBlack), 0, 1, false).
+		AddItem(tview.NewBox(), 0, 1, false).
+		AddItem(searchInput, len("Search")+30, 1, false)
 	buttonsView.SetBackgroundColor(tcell.ColorBlack)
 	controller.ButtonsView = buttonsView
 }
@@ -643,7 +723,24 @@ func (controller *AppController) InitDockerCLI() {
 
 func (controller *AppController) setGlobalCommands() {
 	controller.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if controller.SearchInput != nil && controller.SearchInput.HasFocus() {
+			if event.Key() == tcell.KeyESC {
+				controller.app.SetFocus(controller.ServiceStatusView)
+				controller.PagesHub.SwitchToPage("logs")
+			}
+			return event
+		}
 		switch event.Rune() {
+		case '1':
+			controller.PagesHub.SwitchToPage("")
+		case '/':
+			controller.getSearchLogsView()
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				controller.app.QueueUpdateDraw(func() {
+					controller.app.SetFocus(controller.SearchInput)
+				})
+			}()
 		case 'g':
 			controller.app.SetFocus(controller.ServiceLogsView)
 			controller.ServiceLogsView.ScrollToBeginning()
@@ -661,10 +758,10 @@ func (controller *AppController) setGlobalCommands() {
 		}
 
 		switch event.Key() {
-		case tcell.KeyCtrlA:
-			controller.PagesHub.SwitchToPage("logs")
 		case tcell.KeyCtrlS:
 			controller.PagesHub.SwitchToPage("config")
+		case tcell.KeyEsc:
+			controller.PagesHub.SwitchToPage("logs")
 		}
 		return event
 	})
