@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -36,6 +38,7 @@ type AppController struct {
 	stopLogs          chan bool
 	startLogs         chan bool
 	SearchInput       *tview.InputField
+	BufferLogs        []string
 }
 
 type LogsStream struct {
@@ -234,7 +237,14 @@ func (controller *AppController) feedLogsForSearch() {
 	controller.app.QueueUpdateDraw(func() {
 		controller.ServiceSearchView.Clear()
 	})
-	stdcopy.StdCopy(w, w, reader)
+
+	scanner := bufio.NewScanner(reader)
+	controller.BufferLogs = nil // reset buffer
+	for scanner.Scan() {
+		line := scanner.Text()
+		controller.BufferLogs = append(controller.BufferLogs, line)
+		fmt.Fprintln(w, line)
+	}
 	cancel()
 }
 
@@ -611,19 +621,43 @@ func (controller *AppController) getButtonsView() {
 	helpButton.SetBorderColor(tcell.ColorLimeGreen)
 
 	searchInput := tview.NewInputField().
-		SetLabel("Search: [Press '/']").
+		SetLabel("🔍 Search: [Press '/']").
 		SetFieldWidth(30).
 		SetFieldBackgroundColor(tcell.ColorDarkSlateGray).
 		SetLabelColor(tcell.ColorAqua)
 
 	controller.SearchInput = searchInput
+	searchInput.SetChangedFunc(func(text string) {
+		if text == "" {
+			for _, line := range controller.BufferLogs {
+				fmt.Fprintln(controller.ServiceSearchView, line)
+			}
+		}
+
+		pattern, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(text))
+		if err != nil {
+			for _, line := range controller.BufferLogs {
+				fmt.Fprintln(controller.ServiceSearchView, line)
+			}
+			return
+		}
+
+		for _, line := range controller.BufferLogs {
+			if pattern.MatchString(line) {
+				highlighted := pattern.ReplaceAllStringFunc(line, func(m string) string {
+					return "[red]" + m + "[white]"
+				})
+				fmt.Fprintln(controller.ServiceSearchView, highlighted)
+			}
+		}
+	})
 
 	buttonsView.AddItem(logsButton, 15, 0, false).
 		AddItem(configButton, 15, 0, false).
 		AddItem(helpButton, 15, 0, false).
 		AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorBlack), 0, 1, false).
-		AddItem(tview.NewBox(), 0, 1, false).
-		AddItem(searchInput, len("Search")+30, 1, false)
+		AddItem(tview.NewBox(), 1, 0, false).
+		AddItem(searchInput, 0, 1, false)
 	buttonsView.SetBackgroundColor(tcell.ColorBlack)
 	controller.ButtonsView = buttonsView
 }
@@ -726,7 +760,12 @@ func (controller *AppController) setGlobalCommands() {
 		if controller.SearchInput != nil && controller.SearchInput.HasFocus() {
 			if event.Key() == tcell.KeyESC {
 				controller.app.SetFocus(controller.ServiceStatusView)
+				controller.SearchInput.SetText("")
 				controller.PagesHub.SwitchToPage("logs")
+			}
+			if event.Key() == tcell.KeyEnter {
+				controller.app.SetFocus(controller.ServiceSearchView)
+				controller.PagesHub.SwitchToPage("search")
 			}
 			return event
 		}
