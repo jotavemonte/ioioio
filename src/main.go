@@ -241,7 +241,6 @@ func (controller *AppController) getHelpView() {
 	helpView.SetTitle("Help")
 	helpView.SetTitleColor(tcell.ColorLimeGreen)
 	helpView.SetBorderColor(tcell.ColorLimeGreen)
-	helpView.SetBackgroundColor(tcell.ColorBlack)
 	helpView.SetScrollable(true)
 
 	helpText := `Container Statuses:
@@ -382,7 +381,6 @@ func (controller *AppController) getServiceLogsView() {
 	logs_view.SetTitle("Logs")
 	logs_view.SetTitleColor(tcell.ColorLimeGreen)
 	logs_view.SetBorderColor(tcell.ColorLimeGreen)
-	logs_view.SetBackgroundColor(tcell.ColorBlack)
 	logs_view.SetScrollable(true)
 	logs_view.SetChangedFunc(func() {
 		controller.app.Draw()
@@ -449,11 +447,11 @@ func (controller *AppController) updateServicesStatus() {
 }
 
 func (controller *AppController) InitInterface() {
+	tview.Styles.PrimitiveBackgroundColor = tcell.ColorDefault
 	app := tview.NewApplication()
 	controller.app = app
 
 	controller.PagesHub = tview.NewPages()
-	controller.PagesHub.SetBackgroundColor(tcell.ColorBlack)
 	controller.PagesHub.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEsc:
@@ -476,7 +474,6 @@ func (controller *AppController) InitInterface() {
 	left_box.AddItem(controller.ServiceStatusView, 0, 8, true) // TreeView takes all the space
 
 	horizontalFlex := tview.NewFlex().SetDirection(tview.FlexRow)
-	horizontalFlex.SetBackgroundColor(tcell.ColorBlack)
 	horizontalFlex.AddItem(controller.ButtonsView, 3, 0, false) // Add buttons view at the top
 	horizontalFlex.AddItem(controller.PagesHub, 0, 6, false)
 
@@ -486,7 +483,6 @@ func (controller *AppController) InitInterface() {
 	horizontalFlex.AddItem(controller.DebugOutput, 10, 0, false) // Add the bottom flex containing debug output and legend
 
 	baseFlex := tview.NewFlex()
-	baseFlex.SetBackgroundColor(tcell.ColorBlack)
 	baseFlex.AddItem(left_box, 0, 25, true) // Left panel containing tree view
 	baseFlex.AddItem(horizontalFlex, 0, 75, false)
 
@@ -509,8 +505,8 @@ func (controller *AppController) getButtonsView() {
 		}).
 		SetLabelColor(tcell.ColorLimeGreen)
 	logsButton.SetBorder(true)
-	logsButton.SetBackgroundColorActivated(tcell.ColorBlack)
-	logsButton.SetStyle(tcell.StyleDefault.Background(tcell.ColorBlack))
+	logsButton.SetBackgroundColorActivated(tcell.ColorDefault)
+	logsButton.SetStyle(tcell.StyleDefault.Background(tcell.ColorDefault))
 	logsButton.SetBorderColor(tcell.ColorLimeGreen)
 	configButton := tview.NewButton("<c-S> Config").
 		SetSelectedFunc(func() {
@@ -522,8 +518,8 @@ func (controller *AppController) getButtonsView() {
 		}).
 		SetLabelColor(tcell.ColorLimeGreen)
 	configButton.SetBorder(true)
-	configButton.SetBackgroundColorActivated(tcell.ColorBlack)
-	configButton.SetStyle(tcell.StyleDefault.Background(tcell.ColorBlack))
+	configButton.SetBackgroundColorActivated(tcell.ColorDefault)
+	configButton.SetStyle(tcell.StyleDefault.Background(tcell.ColorDefault))
 	configButton.SetBorderColor(tcell.ColorLimeGreen)
 
 	helpButton := tview.NewButton("<?> Help").
@@ -536,15 +532,14 @@ func (controller *AppController) getButtonsView() {
 		}).
 		SetLabelColor(tcell.ColorLimeGreen)
 	helpButton.SetBorder(true)
-	helpButton.SetBackgroundColorActivated(tcell.ColorBlack)
-	helpButton.SetStyle(tcell.StyleDefault.Background(tcell.ColorBlack))
+	helpButton.SetBackgroundColorActivated(tcell.ColorDefault)
+	helpButton.SetStyle(tcell.StyleDefault.Background(tcell.ColorDefault))
 	helpButton.SetBorderColor(tcell.ColorLimeGreen)
 
 	buttonsView.AddItem(logsButton, 15, 0, false).
 		AddItem(configButton, 15, 0, false).
 		AddItem(helpButton, 15, 0, false).
-		AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorBlack), 0, 1, false)
-	buttonsView.SetBackgroundColor(tcell.ColorBlack)
+		AddItem(tview.NewBox(), 0, 1, false)
 	controller.ButtonsView = buttonsView
 }
 
@@ -616,7 +611,6 @@ func (controller *AppController) getServiceConfigurationView() {
 	configView.SetTitle("Logs")
 	configView.SetTitleColor(tcell.ColorLimeGreen)
 	configView.SetBorderColor(tcell.ColorLimeGreen)
-	configView.SetBackgroundColor(tcell.ColorBlack)
 	configView.SetScrollable(true)
 	configView.SetTitle("Service Configuration")
 
