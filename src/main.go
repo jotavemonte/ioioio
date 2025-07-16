@@ -235,7 +235,6 @@ func (controller *AppController) selectFirstContainer() {
 
 func (controller *AppController) getHelpView() {
 	helpView := tview.NewTextView()
-	helpView.SetDynamicColors(true)
 	helpView.SetRegions(true)
 	helpView.SetBorder(true)
 	helpView.SetTitle("Help")
@@ -283,11 +282,10 @@ func (controller *AppController) getServiceListView() {
 	serviceTreeView.SetTitle("Service Status")
 	serviceTreeView.SetTitleColor(tcell.ColorLimeGreen)
 	serviceTreeView.SetBorderColor(tcell.ColorLimeGreen)
-	serviceTreeView.SetGraphics(true)
-	serviceTreeView.SetGraphicsColor(tcell.ColorGreen)
+	serviceTreeView.SetGraphicsColor(tcell.ColorLimeGreen)
 
 	root := tview.NewTreeNode("Services").
-		SetColor(tcell.ColorYellow).
+		SetColor(tcell.ColorRed).
 		SetSelectable(false)
 	serviceTreeView.SetRoot(root)
 
@@ -322,7 +320,7 @@ func (controller *AppController) getServiceListView() {
 
 	for _, project := range filteredProjects {
 		projectNode := tview.NewTreeNode(project).
-			SetColor(tcell.ColorBlue).
+			SetColor(tcell.ColorYellow).
 			SetSelectable(false).
 			SetExpanded(true)
 		root.AddChild(projectNode)
@@ -335,8 +333,8 @@ func (controller *AppController) getServiceListView() {
 		for _, container := range containers {
 			containerText := buildContainerText(container)
 			containerNode := tview.NewTreeNode(containerText).
-				SetColor(tcell.ColorWhite).
-				SetReference(container.ID) // Store container ID as reference
+				SetReference(container.ID). // Store container ID as reference
+				SetColor(tcell.ColorBlue)
 
 			projectNode.AddChild(containerNode)
 		}
@@ -373,9 +371,7 @@ func buildContainerText(container Container) string {
 }
 
 func (controller *AppController) getServiceLogsView() {
-
 	logs_view := tview.NewTextView()
-	logs_view.SetDynamicColors(true)
 	logs_view.SetRegions(true)
 	logs_view.SetBorder(true)
 	logs_view.SetTitle("Logs")
@@ -448,6 +444,7 @@ func (controller *AppController) updateServicesStatus() {
 
 func (controller *AppController) InitInterface() {
 	tview.Styles.PrimitiveBackgroundColor = tcell.ColorDefault
+	tview.Styles.PrimaryTextColor = tcell.ColorDefault
 	app := tview.NewApplication()
 	controller.app = app
 
@@ -605,7 +602,6 @@ func (controller *AppController) updateConfigView() {
 
 func (controller *AppController) getServiceConfigurationView() {
 	configView := tview.NewTextView()
-	configView.SetDynamicColors(true)
 	configView.SetRegions(true)
 	configView.SetBorder(true)
 	configView.SetTitle("Logs")
