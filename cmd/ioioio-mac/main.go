@@ -45,6 +45,10 @@ type ui struct {
 	tabs       appkit.SegmentedControl
 	status     appkit.TextField
 
+	startBtn   appkit.Button
+	stopBtn    appkit.Button
+	restartBtn appkit.Button
+
 	findBar   appkit.StackView
 	findField appkit.SearchField
 	findCount appkit.TextField
@@ -53,8 +57,41 @@ type ui struct {
 
 	rows       []row
 	selectedID string
+	// restoringSelection suppresses the selection-changed handler while we
+	// programmatically re-highlight a row after a reload, so the log stream
+	// isn't needlessly restarted.
+	restoringSelection bool
+	// actionInFlight disables the action buttons while a start/stop/restart
+	// Docker call is running, to prevent double-clicks.
+	actionInFlight bool
 
 	logsCancel context.CancelFunc
+}
+
+// selectedState returns the Docker state of the currently selected container,
+// or "" when nothing is selected.
+func (u *ui) selectedState() string {
+	for _, r := range u.rows {
+		if !r.isGroup && r.container.ID == u.selectedID {
+			return r.container.State
+		}
+	}
+	return ""
+}
+
+// updateButtons enables/disables the action buttons to match the selected
+// container's state. Must be called on the main thread.
+func (u *ui) updateButtons() {
+	state := u.selectedState()
+	running := state == "running"
+	selected := state != ""
+
+	enabled := selected && !u.actionInFlight
+	// Start is available only when the container is not already running.
+	u.startBtn.SetEnabled(enabled && !running)
+	// Stop and Restart require a running container.
+	u.stopBtn.SetEnabled(enabled && running)
+	u.restartBtn.SetEnabled(enabled && running)
 }
 
 // activeTextView returns the text view for the pane currently shown.
@@ -200,6 +237,9 @@ func (u *ui) buildSidebar() appkit.ScrollView {
 		return stack.View
 	})
 	del.SetTableViewSelectionDidChange(func(foundation.Notification) {
+		if u.restoringSelection {
+			return
+		}
 		u.onSelect(u.table.SelectedRow())
 	})
 	table.SetDelegate(del)
@@ -220,6 +260,11 @@ func (u *ui) buildDetail() appkit.View {
 	stop := iconButton("Stop", "stop.fill", func() { u.act("stop") })
 	restart := iconButton("Restart", "arrow.clockwise", func() { u.act("restart") })
 	help := iconButton("Help", "questionmark.circle", func() { u.showHelp() })
+	u.startBtn, u.stopBtn, u.restartBtn = start, stop, restart
+	// Disabled until a container is selected; updateButtons() sets them.
+	start.SetEnabled(false)
+	stop.SetEnabled(false)
+	restart.SetEnabled(false)
 
 	// Logs / Config toggle.
 	tabs := appkit.NewSegmentedControl()
@@ -485,6 +530,7 @@ func (u *ui) onSelect(rowIndex int) {
 	}
 	c := u.rows[rowIndex].container
 	u.selectedID = c.ID
+	u.updateButtons()
 
 	u.startLogs(c)
 	go u.loadConfig(c)
@@ -530,6 +576,11 @@ func (u *ui) act(op string) {
 		u.setStatus("No container selected.")
 		return
 	}
+
+	// Disable the action buttons until the operation finishes.
+	u.actionInFlight = true
+	u.updateButtons()
+
 	go func() {
 		ctx := context.Background()
 		var err error
@@ -541,13 +592,41 @@ func (u *ui) act(op string) {
 		case "restart":
 			err = u.docker.Restart(ctx, id)
 		}
+
+		dispatch.MainQueue().DispatchAsync(func() {
+			u.actionInFlight = false
+			u.updateButtons()
+		})
+
 		if err != nil {
 			u.setStatus(fmt.Sprintf("Error (%s): %v", op, err))
 			return
 		}
 		u.setStatus(fmt.Sprintf("Container %s: %s ok.", id[:12], op))
+
+		// start/restart give the container a new process, so the existing log
+		// follow points at the old (now-dead) stream. Re-attach to the fresh
+		// one so logs keep flowing without a manual reselect.
+		if op == "start" || op == "restart" {
+			dispatch.MainQueue().DispatchAsync(func() {
+				if i := u.selectedRow(); i >= 0 {
+					u.startLogs(u.rows[i].container)
+				}
+			})
+		}
+
 		u.reload()
 	}()
+}
+
+// selectedRow returns the row index of the currently selected container, or -1.
+func (u *ui) selectedRow() int {
+	for i, r := range u.rows {
+		if !r.isGroup && r.container.ID == u.selectedID {
+			return i
+		}
+	}
+	return -1
 }
 
 // reload fetches the current containers and rebuilds the sidebar rows on the
@@ -571,18 +650,39 @@ func (u *ui) reload() {
 	dispatch.MainQueue().DispatchAsync(func() {
 		u.rows = rows
 		u.table.ReloadData()
+		u.restoreSelection()
+	})
+}
 
-		// Select the first container by default when nothing is selected yet.
-		if u.selectedID == "" {
-			for i, r := range u.rows {
-				if !r.isGroup {
-					u.table.SelectRowIndexesByExtendingSelection(foundation.NewIndexSetWithIndex(uint(i)), false)
-					u.onSelect(i)
-					break
-				}
+// restoreSelection re-highlights the currently selected container after a
+// ReloadData (which clears the table selection). When nothing is selected yet
+// it selects the first container and starts streaming it.
+func (u *ui) restoreSelection() {
+	target := u.selectedID
+	if target == "" {
+		// First load: pick the first container and stream it for real.
+		for i, r := range u.rows {
+			if !r.isGroup {
+				u.table.SelectRowIndexesByExtendingSelection(foundation.NewIndexSetWithIndex(uint(i)), false)
+				u.onSelect(i)
+				return
 			}
 		}
-	})
+		return
+	}
+
+	// Re-highlight the already-selected container without re-triggering the
+	// selection handler (its logs are already streaming), then refresh the
+	// action buttons in case the container's state changed.
+	for i, r := range u.rows {
+		if !r.isGroup && r.container.ID == target {
+			u.restoringSelection = true
+			u.table.SelectRowIndexesByExtendingSelection(foundation.NewIndexSetWithIndex(uint(i)), false)
+			u.restoringSelection = false
+			u.updateButtons()
+			return
+		}
+	}
 }
 
 // watch polls Docker and refreshes the sidebar whenever a container's state
