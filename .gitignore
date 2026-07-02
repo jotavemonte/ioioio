@@ -26,4 +26,6 @@ go.work
 
 # End of https://www.toptal.com/developers/gitignore/api/go
 __debug_bin*
-ioioio
+/ioioio
+/ioioio-mac
+/dist/

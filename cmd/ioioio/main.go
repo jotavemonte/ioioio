@@ -4,28 +4,18 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sort"
-	"strings"
 	"time"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
+	"jotavemonte/ioioio/internal/core"
+
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
-type Container struct {
-	ID      string
-	Name    string
-	Project string
-	State   string
-}
-
 type AppController struct {
 	ServiceStatusView *tview.TreeView
 	ServiceLogsView   *tview.TextView
-	DockerClient      *client.Client
+	Docker            *core.Client
 	DebugOutput       *tview.TextView
 	ConfiguraitonView *tview.TextView
 	HelpView          *tview.TextView
@@ -43,7 +33,7 @@ type LogsStream struct {
 
 var currentLogsStream *LogsStream = &LogsStream{}
 
-var containers = make(map[string]Container)
+var containers = make(map[string]core.Container)
 
 func (controller *AppController) writeToDebug(text string) {
 	if controller.DebugOutput == nil {
@@ -79,9 +69,7 @@ func (controller *AppController) logContainerController() {
 }
 
 func (controller *AppController) restartContainer() {
-	ctx := context.Background()
 	containerId := currentLogsStream.ContainerID
-
 	if containerId == "" {
 		return
 	}
@@ -90,8 +78,7 @@ func (controller *AppController) restartContainer() {
 	containerIdentifier := container.Project + "/" + container.Name
 
 	controller.writeToDebug("Restarting container " + containerIdentifier + "...")
-	err := controller.DockerClient.ContainerRestart(ctx, containerId, containertypes.StopOptions{})
-	if err != nil {
+	if err := controller.Docker.Restart(context.Background(), containerId); err != nil {
 		controller.writeToDebug("Error restarting container " + containerIdentifier + ": " + err.Error())
 		return
 	}
@@ -100,9 +87,7 @@ func (controller *AppController) restartContainer() {
 }
 
 func (controller *AppController) stopContainer() {
-	ctx := context.Background()
 	containerId := currentLogsStream.ContainerID
-
 	if containerId == "" {
 		return
 	}
@@ -111,8 +96,7 @@ func (controller *AppController) stopContainer() {
 	containerIdentifier := container.Project + "/" + container.Name
 
 	controller.writeToDebug("Stopping container " + containerIdentifier + "...")
-	err := controller.DockerClient.ContainerStop(ctx, containerId, containertypes.StopOptions{})
-	if err != nil {
+	if err := controller.Docker.Stop(context.Background(), containerId); err != nil {
 		controller.writeToDebug("Error stopping container " + containerIdentifier + ": " + err.Error())
 		return
 	}
@@ -122,9 +106,7 @@ func (controller *AppController) stopContainer() {
 }
 
 func (controller *AppController) startContainer() {
-	ctx := context.Background()
 	containerId := currentLogsStream.ContainerID
-
 	if containerId == "" {
 		return
 	}
@@ -133,8 +115,7 @@ func (controller *AppController) startContainer() {
 	containerIdentifier := container.Project + "/" + container.Name
 
 	controller.writeToDebug("Starting container " + containerIdentifier + "...")
-	err := controller.DockerClient.ContainerStart(ctx, containerId, containertypes.StartOptions{})
-	if err != nil {
+	if err := controller.Docker.Start(context.Background(), containerId); err != nil {
 		controller.writeToDebug("Error starting container " + containerIdentifier + ": " + err.Error())
 		return
 	}
@@ -150,22 +131,12 @@ func (controller *AppController) feedLogForContainer() {
 	controller.ServiceLogsView.SetTitle("Logs - " + "(" + containerProject + "/" + containerName + ")")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	reader, err := controller.DockerClient.ContainerLogs(ctx, currentLogsStream.ContainerID, containertypes.LogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-		Follow:     true, // Stream logs
-		Tail:       "200",
-	})
-	if err != nil {
-		return
-	}
-	defer reader.Close()
-
-	w := tview.ANSIWriter(controller.ServiceLogsView)
 
 	if controller.ServiceLogsView == nil {
 		return
 	}
+
+	w := tview.ANSIWriter(controller.ServiceLogsView)
 
 	go func() {
 		<-controller.stopLogs
@@ -182,41 +153,17 @@ func (controller *AppController) feedLogForContainer() {
 	controller.app.QueueUpdateDraw(func() {
 		controller.ServiceLogsView.Clear()
 	})
-	stdcopy.StdCopy(w, w, reader)
+	controller.Docker.StreamLogs(ctx, currentContainerId, w)
 	cancel()
 }
 
 func (controller *AppController) getServiceStatus() {
-	ctx := context.Background()
-
-	fetchedContainers, err := controller.DockerClient.ContainerList(ctx, containertypes.ListOptions{All: true})
+	fetched, err := controller.Docker.List(context.Background())
 	if err != nil {
 		return
 	}
-
-	for _, fetchedContainer := range fetchedContainers {
-		name := fetchedContainer.Labels["com.docker.compose.service"]
-		if name == "" {
-			// If not a compose service, use container name
-			if len(fetchedContainer.Names) > 0 {
-				name = fetchedContainer.Names[0]
-				if len(name) > 0 && name[0] == '/' {
-					name = name[1:]
-				}
-			}
-		}
-
-		project := fetchedContainer.Labels["com.docker.compose.project"]
-		if project == "" {
-			project = "standalone"
-		}
-
-		containers[fetchedContainer.ID] = Container{
-			ID:      fetchedContainer.ID,
-			Name:    name,
-			Project: project,
-			State:   fetchedContainer.State,
-		}
+	for id, c := range fetched {
+		containers[id] = c
 	}
 }
 
@@ -289,48 +236,16 @@ func (controller *AppController) getServiceListView() {
 		SetSelectable(false)
 	serviceTreeView.SetRoot(root)
 
-	projectMap := make(map[string][]Container)
-	for _, container := range containers {
-		projectMap[container.Project] = append(projectMap[container.Project], container)
-	}
+	projects := core.GroupByProject(containers, os.Args[1:])
 
-	projects := make([]string, 0, len(projectMap))
-	for project := range projectMap {
-		projects = append(projects, project)
-	}
-	sort.Strings(projects)
-
-	argsProjects := os.Args[:]
-	argsProjectsMap := make(map[string]bool)
-
-	for _, arg := range argsProjects {
-		argsProjectsMap[arg] = true
-	}
-
-	filteredProjects := make([]string, 0, len(projects))
-	if len(argsProjects) > 1 {
-		for _, arg := range projects {
-			if exists, ok := argsProjectsMap[arg]; ok && exists {
-				filteredProjects = append(filteredProjects, arg)
-			}
-		}
-	} else {
-		filteredProjects = append(filteredProjects, projects...)
-	}
-
-	for _, project := range filteredProjects {
-		projectNode := tview.NewTreeNode(project).
+	for _, project := range projects {
+		projectNode := tview.NewTreeNode(project.Name).
 			SetColor(tcell.ColorYellow).
 			SetSelectable(false).
 			SetExpanded(true)
 		root.AddChild(projectNode)
 
-		containers := projectMap[project]
-		sort.Slice(containers, func(i, j int) bool {
-			return containers[i].Name < containers[j].Name
-		})
-
-		for _, container := range containers {
+		for _, container := range project.Containers {
 			containerText := buildContainerText(container)
 			containerNode := tview.NewTreeNode(containerText).
 				SetReference(container.ID). // Store container ID as reference
@@ -359,7 +274,7 @@ func (controller *AppController) getServiceListView() {
 	controller.ServiceStatusView = serviceTreeView
 }
 
-func buildContainerText(container Container) string {
+func buildContainerText(container core.Container) string {
 	statusEmojiMap := map[string]string{
 		"running":    "💚",
 		"exited":     "🛑",
@@ -390,15 +305,9 @@ func (controller *AppController) updateServicesStatus() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		oldContainers := make(map[string]Container)
+		oldContainers := make(map[string]core.Container)
 		for k, v := range containers {
-			vCopy := Container{
-				ID:      strings.Clone(v.ID),
-				Name:    strings.Clone(v.Name),
-				Project: strings.Clone(v.Project),
-				State:   strings.Clone(v.State),
-			}
-			oldContainers[strings.Clone(k)] = vCopy
+			oldContainers[k] = v
 		}
 
 		controller.getServiceStatus()
@@ -541,61 +450,17 @@ func (controller *AppController) getButtonsView() {
 }
 
 func (controller *AppController) updateConfigView() {
-	resp, err := controller.DockerClient.ContainerInspect(context.Background(), currentLogsStream.ContainerID)
+	containerName := containers[currentLogsStream.ContainerID].Name
+	containerProject := containers[currentLogsStream.ContainerID].Project
+
+	text, err := controller.Docker.InspectConfigText(context.Background(), currentLogsStream.ContainerID, containerProject, containerName)
 	if err != nil {
 		controller.writeToDebug("Error inspecting container: " + err.Error())
 		return
 	}
 
-	var builder strings.Builder
-
-	containerName := containers[currentLogsStream.ContainerID].Name
-	containerProject := containers[currentLogsStream.ContainerID].Project
-
-	builder.WriteString(fmt.Sprintf("Container: %s/%s\n\n", containerProject, containerName))
-
-	builder.WriteString("Configuration Details:\n")
-	builder.WriteString("---------------------\n")
-	builder.WriteString(fmt.Sprintf("Hostname: %s\n", resp.Config.Hostname))
-	builder.WriteString(fmt.Sprintf("Domainname: %s\n", resp.Config.Domainname))
-	builder.WriteString(fmt.Sprintf("User: %s\n", resp.Config.User))
-	builder.WriteString(fmt.Sprintf("AttachStdin: %t\n", resp.Config.AttachStdin))
-	builder.WriteString(fmt.Sprintf("AttachStdout: %t\n", resp.Config.AttachStdout))
-	builder.WriteString(fmt.Sprintf("AttachStderr: %t\n", resp.Config.AttachStderr))
-	builder.WriteString(fmt.Sprintf("ExposedPorts: %v\n", resp.Config.ExposedPorts))
-	builder.WriteString(fmt.Sprintf("Tty: %t\n", resp.Config.Tty))
-	builder.WriteString(fmt.Sprintf("OpenStdin: %t\n", resp.Config.OpenStdin))
-	builder.WriteString(fmt.Sprintf("StdinOnce: %t\n", resp.Config.StdinOnce))
-
-	builder.WriteString(fmt.Sprintf("Image: %s\n", resp.Config.Image))
-	builder.WriteString(fmt.Sprintf("Entrypoint: %v\n", resp.Config.Entrypoint))
-	builder.WriteString(fmt.Sprintf("Cmd: %v\n", resp.Config.Cmd))
-	builder.WriteString(fmt.Sprintf("WorkingDir: %s\n", resp.Config.WorkingDir))
-
-	builder.WriteString("\nEnvironment Variables:\n")
-	envVars := resp.Config.Env
-	sort.Strings(envVars)
-	for _, value := range envVars {
-		builder.WriteString(fmt.Sprintf("• %s\n", value))
-	}
-
-	builder.WriteString("\nLabels:\n")
-	labels := make([]string, 0, len(resp.Config.Labels))
-	for k, v := range resp.Config.Labels {
-		labels = append(labels, fmt.Sprintf("%s: %s", k, v))
-	}
-	sort.Strings(labels)
-	for _, label := range labels {
-		builder.WriteString(fmt.Sprintf("• %s\n", label))
-	}
-
-	builder.WriteString("\nVolumes:\n")
-	for vol := range resp.Config.Volumes {
-		builder.WriteString(fmt.Sprintf("• %s\n", vol))
-	}
-
 	controller.app.QueueUpdateDraw(func() {
-		controller.ConfiguraitonView.SetText(builder.String())
+		controller.ConfiguraitonView.SetText(text)
 		controller.ConfiguraitonView.ScrollToBeginning()
 	})
 }
@@ -619,16 +484,6 @@ func (controller *AppController) getServiceConfigurationView() {
 	controller.ConfiguraitonView = configView
 
 	controller.PagesHub.AddPage("config", controller.ConfiguraitonView, true, false)
-}
-
-func (controller *AppController) InitDockerCLI() {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating Docker client: %v\n", err)
-		return
-	}
-
-	controller.DockerClient = cli
 }
 
 func (controller *AppController) setGlobalCommands() {
@@ -665,8 +520,13 @@ func main() {
 
 	controller.startLogs, controller.stopLogs = make(chan bool, 2), make(chan bool, 2)
 
-	controller.InitDockerCLI()
-	defer controller.DockerClient.Close()
+	docker, err := core.NewClient()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating Docker client: %v\n", err)
+		os.Exit(1)
+	}
+	controller.Docker = docker
+	defer controller.Docker.Close()
 
 	go controller.logContainerController()
 	go controller.updateServicesStatus()
