@@ -155,6 +155,12 @@ func (u *ui) setMainMenu(app appkit.Application) {
 
 	editItem := appkit.NewMenuItem()
 	editMenu := appkit.NewMenuWithTitle("Edit")
+	// Standard editing items with nil target: AppKit dispatches these selectors
+	// down the responder chain to the focused text view, which is what makes
+	// ⌘C / ⌘A work on the log and config buffers. Without them the keystrokes
+	// have no menu item to trigger and are ignored.
+	editMenu.AddItem(appkit.NewMenuItemWithTitleActionKeyEquivalent("Copy", objc.Sel("copy:"), "c"))
+	editMenu.AddItem(appkit.NewMenuItemWithTitleActionKeyEquivalent("Select All", objc.Sel("selectAll:"), "a"))
 	editMenu.AddItem(appkit.NewMenuItemWithAction("Find", "f", func(objc.Object) { u.toggleFind() }))
 	editItem.SetSubmenu(editMenu)
 	menuBar.AddItem(editItem)
@@ -395,6 +401,9 @@ func newTextView() (appkit.TextView, appkit.ScrollView) {
 
 	tv := appkit.NewTextViewWithFrame(foundation.Rect{Size: foundation.Size{Width: 400, Height: 300}})
 	tv.SetEditable(false)
+	// Read-only but still selectable, so text can be highlighted and copied
+	// (⌘C via the Edit menu's copy: item).
+	tv.SetSelectable(true)
 	tv.SetRichText(false)
 	tv.SetFont(textFont())
 	// Draw on the standard text background with the dynamic label color so the
