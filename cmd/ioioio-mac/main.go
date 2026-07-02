@@ -739,19 +739,33 @@ Pass project names as arguments to filter the sidebar:
 }
 
 // textViewWriter appends streamed log bytes to an NSTextView on the main thread.
-// It appends an *attributed* string carrying the foreground color and font so
-// the text stays visible — a plain AppendString would inherit no color and
-// render black (invisible in dark mode).
+// It parses ANSI SGR color escapes into per-run foreground colors and appends
+// each run as an *attributed* string carrying that color and the monospaced
+// font — a plain AppendString would inherit no color and render black
+// (invisible in dark mode), and the raw escape bytes would show as garbage.
 type textViewWriter struct {
 	tv    appkit.TextView
 	attrs map[foundation.AttributedStringKey]objc.IObject
+	ansi  ansiParser
 }
 
 func (w *textViewWriter) Write(p []byte) (int, error) {
-	s := string(p)
+	runs := w.ansi.feed(string(p))
+	if len(runs) == 0 {
+		return len(p), nil
+	}
 	dispatch.MainQueue().DispatchAsync(func() {
 		storage := w.tv.TextStorage()
-		storage.AppendAttributedString(foundation.NewAttributedStringWithStringAttributes(s, w.attrs))
+		for _, r := range runs {
+			attrs := w.attrs
+			if r.fg {
+				attrs = map[foundation.AttributedStringKey]objc.IObject{
+					foundation.AttributedStringKey("NSColor"): r.color,
+					foundation.AttributedStringKey("NSFont"):  textFont(),
+				}
+			}
+			storage.AppendAttributedString(foundation.NewAttributedStringWithStringAttributes(r.text, attrs))
+		}
 		w.tv.ScrollRangeToVisible(foundation.Range{Location: uint64(storage.Length()), Length: 0})
 	})
 	return len(p), nil
