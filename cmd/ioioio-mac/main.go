@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -48,6 +49,7 @@ type ui struct {
 	startBtn   appkit.Button
 	stopBtn    appkit.Button
 	restartBtn appkit.Button
+	shellBtn   appkit.Button
 
 	findBar   appkit.StackView
 	findField appkit.SearchField
@@ -89,9 +91,10 @@ func (u *ui) updateButtons() {
 	enabled := selected && !u.actionInFlight
 	// Start is available only when the container is not already running.
 	u.startBtn.SetEnabled(enabled && !running)
-	// Stop and Restart require a running container.
+	// Stop, Restart and Shell require a running container.
 	u.stopBtn.SetEnabled(enabled && running)
 	u.restartBtn.SetEnabled(enabled && running)
+	u.shellBtn.SetEnabled(enabled && running)
 }
 
 // activeTextView returns the text view for the pane currently shown.
@@ -259,12 +262,14 @@ func (u *ui) buildDetail() appkit.View {
 	start := iconButton("Start", "play.fill", func() { u.act("start") })
 	stop := iconButton("Stop", "stop.fill", func() { u.act("stop") })
 	restart := iconButton("Restart", "arrow.clockwise", func() { u.act("restart") })
+	shell := iconButton("Shell", "terminal", func() { u.openShell() })
 	help := iconButton("Help", "questionmark.circle", func() { u.showHelp() })
-	u.startBtn, u.stopBtn, u.restartBtn = start, stop, restart
+	u.startBtn, u.stopBtn, u.restartBtn, u.shellBtn = start, stop, restart, shell
 	// Disabled until a container is selected; updateButtons() sets them.
 	start.SetEnabled(false)
 	stop.SetEnabled(false)
 	restart.SetEnabled(false)
+	shell.SetEnabled(false)
 
 	// Logs / Config toggle.
 	tabs := appkit.NewSegmentedControl()
@@ -280,7 +285,7 @@ func (u *ui) buildDetail() appkit.View {
 	find := iconButton("", "magnifyingglass", func() { u.toggleFind() })
 
 	toolbar := appkit.StackView_StackViewWithViews([]appkit.IView{
-		start, stop, restart, help, tabs, find,
+		start, stop, restart, shell, help, tabs, find,
 	})
 	toolbar.SetOrientation(appkit.UserInterfaceLayoutOrientationHorizontal)
 	toolbar.SetSpacing(8)
@@ -619,6 +624,55 @@ func (u *ui) act(op string) {
 	}()
 }
 
+// openShell opens an interactive shell inside the selected container in the
+// user's default terminal application. It runs `docker exec` eagerly launching
+// bash, falling back to sh when bash isn't present in the image.
+//
+// The command is written to a temporary executable .command script which is
+// then handed to `open`, so it launches in whatever terminal is registered as
+// the handler for .command files (Terminal.app, iTerm, …) rather than a
+// hard-coded app.
+func (u *ui) openShell() {
+	i := u.selectedRow()
+	if i < 0 {
+		u.setStatus("No container selected.")
+		return
+	}
+	c := u.rows[i].container
+
+	// Inside the container: prefer bash, fall back to sh. -it gives an
+	// interactive TTY. Using the container ID avoids name-collision ambiguity.
+	inner := fmt.Sprintf(
+		"docker exec -it %s sh -c 'command -v bash >/dev/null 2>&1 && exec bash || exec sh'",
+		c.ID)
+	script := fmt.Sprintf("#!/bin/sh\nexec %s\n", inner)
+
+	f, err := os.CreateTemp("", "ioioio-shell-*.command")
+	if err != nil {
+		u.setStatus("Error opening shell: " + err.Error())
+		return
+	}
+	name := f.Name()
+	if _, err := f.WriteString(script); err != nil {
+		f.Close()
+		u.setStatus("Error opening shell: " + err.Error())
+		return
+	}
+	f.Close()
+	if err := os.Chmod(name, 0o700); err != nil {
+		u.setStatus("Error opening shell: " + err.Error())
+		return
+	}
+
+	go func() {
+		if err := exec.Command("open", name).Run(); err != nil {
+			u.setStatus("Error opening shell: " + err.Error())
+			return
+		}
+		u.setStatus(fmt.Sprintf("Opened shell for %s/%s in terminal.", c.Project, c.Name))
+	}()
+}
+
 // selectedRow returns the row index of the currently selected container, or -1.
 func (u *ui) selectedRow() int {
 	for i, r := range u.rows {
@@ -731,6 +785,8 @@ func (u *ui) showHelp() {
 
 Actions (toolbar):
 Start / Stop / Restart act on the selected container.
+Shell opens an interactive shell (bash, or sh) inside the
+container in your default terminal.
 Logs / Config toggles the detail pane.
 
 Pass project names as arguments to filter the sidebar:
