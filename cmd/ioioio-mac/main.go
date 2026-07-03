@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"jotavemonte/ioioio/internal/core"
@@ -43,6 +44,9 @@ type ui struct {
 	configView appkit.TextView
 	logsScroll appkit.ScrollView
 	cfgScroll  appkit.ScrollView
+	// logsPane wraps logsScroll plus the overlaid jump button; showTab hides the
+	// whole pane so the button doesn't linger over the config view.
+	logsPane appkit.View
 	// jumpBtn floats over the bottom-right of the logs pane; it appears when the
 	// user has scrolled up away from the tail and jumps back to the bottom.
 	jumpBtn appkit.Button
@@ -307,7 +311,7 @@ func (u *ui) buildDetail() appkit.View {
 	u.logsView, u.logsScroll = newTextView()
 	u.configView, u.cfgScroll = newTextView()
 	setText(u.configView, "Select a container to view its configuration.")
-	u.buildJumpButton()
+	logsPane := u.buildLogsPane()
 
 	// Status bar.
 	status := appkit.NewLabel("Ready")
@@ -321,7 +325,7 @@ func (u *ui) buildDetail() appkit.View {
 	column.SetEdgeInsets(foundation.EdgeInsets{Top: 8, Left: 8, Bottom: 8, Right: 8})
 	column.AddArrangedSubview(toolbar)
 	column.AddArrangedSubview(u.buildFindBar())
-	column.AddArrangedSubview(u.logsScroll)
+	column.AddArrangedSubview(logsPane)
 	column.AddArrangedSubview(u.cfgScroll)
 	column.AddArrangedSubview(status)
 
@@ -376,28 +380,71 @@ func (u *ui) buildFindBar() appkit.View {
 	return bar.View
 }
 
-// buildJumpButton creates the floating "jump to bottom" button and pins it to
-// the bottom-right of the logs scroll view. It's added as a direct subview of
-// the scroll view (not the scrolled document) so it stays put as logs scroll.
-// It starts hidden and is shown whenever the user scrolls away from the tail.
-func (u *ui) buildJumpButton() {
-	b := appkit.NewButtonWithTitle("")
-	if img := appkit.Image_ImageWithSystemSymbolNameAccessibilityDescription("chevron.down", "Jump to bottom"); !img.IsNil() {
-		b.SetImage(img)
+// arrowCursorButtonClass is an NSButton subclass that forces the arrow cursor
+// while the mouse is over it. The jump button floats over the logs NSTextView,
+// whose I-beam cursor is driven by its own tracking areas and takes precedence
+// over plain cursor rects — so we override cursorUpdate:/mouseEntered: and set
+// the arrow explicitly, backed by a tracking area covering the button.
+var arrowCursorButtonClass = sync.OnceValue(func() objc.Class {
+	c := objc.AllocateClass(objc.GetClass("NSButton"), "IoioioArrowCursorButton", 0)
+	setArrow := func(self objc.Object) { appkit.Cursor_ArrowCursor().Set() }
+	objc.AddMethod(c, objc.Sel("cursorUpdate:"), func(self, event objc.Object) { setArrow(self) })
+	objc.AddMethod(c, objc.Sel("mouseEntered:"), func(self, event objc.Object) { setArrow(self) })
+	objc.AddMethod(c, objc.Sel("mouseMoved:"), func(self, event objc.Object) { setArrow(self) })
+	objc.RegisterClass(c)
+	return c
+})
+
+func newArrowCursorButton() appkit.Button {
+	obj := objc.Call[objc.Object](arrowCursorButtonClass(), objc.Sel("alloc"))
+	b := appkit.ButtonFrom(objc.Call[objc.Object](obj, objc.Sel("init")).Ptr())
+	// CursorUpdate | MouseEnteredAndExited | MouseMoved | ActiveAlways | InVisibleRect.
+	const opts = appkit.TrackingAreaOptions(0x04 | 0x01 | 0x02 | 0x80 | 0x200)
+	ta := appkit.NewTrackingAreaWithRectOptionsOwnerUserInfo(foundation.Rect{}, opts, obj, foundation.Dictionary{})
+	b.AddTrackingArea(ta)
+	return b
+}
+
+// buildLogsPane wraps the logs scroll view in a container and overlays the
+// floating "jump to bottom" button on top of it. The button is a sibling of
+// the scroll view (not a scroll-view subview, which NSScrollView tiles away),
+// pinned to the container's bottom-right so it stays put as logs scroll. It
+// starts hidden and is shown whenever the user scrolls away from the tail.
+func (u *ui) buildLogsPane() appkit.View {
+	container := appkit.NewView()
+	container.SetTranslatesAutoresizingMaskIntoConstraints(false)
+
+	u.logsScroll.SetTranslatesAutoresizingMaskIntoConstraints(false)
+	container.AddSubview(u.logsScroll)
+	u.logsScroll.TopAnchor().ConstraintEqualToAnchor(container.TopAnchor()).SetActive(true)
+	u.logsScroll.BottomAnchor().ConstraintEqualToAnchor(container.BottomAnchor()).SetActive(true)
+	u.logsScroll.LeadingAnchor().ConstraintEqualToAnchor(container.LeadingAnchor()).SetActive(true)
+	u.logsScroll.TrailingAnchor().ConstraintEqualToAnchor(container.TrailingAnchor()).SetActive(true)
+
+	b := newArrowCursorButton()
+	if img := appkit.Image_ImageWithSystemSymbolNameAccessibilityDescription("chevron.down.circle.fill", "Jump to bottom"); !img.IsNil() {
+		cfg := appkit.ImageSymbolConfiguration_ConfigurationWithPointSizeWeight(28, appkit.FontWeightRegular)
+		b.SetImage(img.ImageWithSymbolConfiguration(cfg))
 		b.SetImagePosition(appkit.ImageOnly)
 	} else {
 		b.SetTitle("▼")
 	}
-	b.SetBezelStyle(appkit.BezelStyleCircular)
-	b.SetToolTip("Jump to bottom")
+	// Borderless so the filled-circle symbol reads as the button, with no extra
+	// bezel around it.
+	b.SetBordered(false)
+	b.SetToolTip("Jump to the latest logs")
 	b.SetTranslatesAutoresizingMaskIntoConstraints(false)
-	b.SetHidden(true)
+	b.SetHidden(false) // DEBUG: force visible
 	action.Set(b, func(objc.Object) { u.jumpToBottom() })
 
-	u.logsScroll.AddSubview(b)
-	b.TrailingAnchor().ConstraintEqualToAnchorConstant(u.logsScroll.TrailingAnchor(), -12).SetActive(true)
-	b.BottomAnchor().ConstraintEqualToAnchorConstant(u.logsScroll.BottomAnchor(), -12).SetActive(true)
+	container.AddSubview(b)
+	b.WidthAnchor().ConstraintEqualToConstant(44).SetActive(true)
+	b.HeightAnchor().ConstraintEqualToConstant(44).SetActive(true)
+	b.TrailingAnchor().ConstraintEqualToAnchorConstant(container.TrailingAnchor(), -16).SetActive(true)
+	b.BottomAnchor().ConstraintEqualToAnchorConstant(container.BottomAnchor(), -16).SetActive(true)
 	u.jumpBtn = b
+	u.logsPane = container
+	return container
 }
 
 // clearLogs empties the on-screen logs buffer for the selected container. The
@@ -487,7 +534,7 @@ func newTextView() (appkit.TextView, appkit.ScrollView) {
 // showTab toggles between the Logs (0) and Config (1) panes. Any active search
 // is re-run against the newly shown buffer.
 func (u *ui) showTab(segment int) {
-	u.logsScroll.SetHidden(segment != 0)
+	u.logsPane.SetHidden(segment != 0)
 	u.cfgScroll.SetHidden(segment != 1)
 	if !u.findBar.IsHidden() {
 		u.runSearch(u.findField.StringValue())
