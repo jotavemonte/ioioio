@@ -43,8 +43,11 @@ type ui struct {
 	configView appkit.TextView
 	logsScroll appkit.ScrollView
 	cfgScroll  appkit.ScrollView
-	tabs       appkit.SegmentedControl
-	status     appkit.TextField
+	// jumpBtn floats over the bottom-right of the logs pane; it appears when the
+	// user has scrolled up away from the tail and jumps back to the bottom.
+	jumpBtn appkit.Button
+	tabs    appkit.SegmentedControl
+	status  appkit.TextField
 
 	startBtn   appkit.Button
 	stopBtn    appkit.Button
@@ -287,11 +290,15 @@ func (u *ui) buildDetail() appkit.View {
 	action.Set(tabs, func(objc.Object) { u.showTab(u.tabs.SelectedSegment()) })
 	u.tabs = tabs
 
+	// Clears the on-screen logs buffer for the selected container. Switching
+	// away and back re-fetches the tail, so this is purely a view reset.
+	clear := iconButton("Clear", "trash", func() { u.clearLogs() })
+
 	// Magnifier button that toggles the find bar (same as ⌘F).
 	find := iconButton("", "magnifyingglass", func() { u.toggleFind() })
 
 	toolbar := appkit.StackView_StackViewWithViews([]appkit.IView{
-		start, stop, restart, shell, help, tabs, find,
+		start, stop, restart, shell, help, tabs, clear, find,
 	})
 	toolbar.SetOrientation(appkit.UserInterfaceLayoutOrientationHorizontal)
 	toolbar.SetSpacing(8)
@@ -300,6 +307,7 @@ func (u *ui) buildDetail() appkit.View {
 	u.logsView, u.logsScroll = newTextView()
 	u.configView, u.cfgScroll = newTextView()
 	setText(u.configView, "Select a container to view its configuration.")
+	u.buildJumpButton()
 
 	// Status bar.
 	status := appkit.NewLabel("Ready")
@@ -366,6 +374,46 @@ func (u *ui) buildFindBar() appkit.View {
 	bar.SetHidden(true)
 	u.findBar = bar
 	return bar.View
+}
+
+// buildJumpButton creates the floating "jump to bottom" button and pins it to
+// the bottom-right of the logs scroll view. It's added as a direct subview of
+// the scroll view (not the scrolled document) so it stays put as logs scroll.
+// It starts hidden and is shown whenever the user scrolls away from the tail.
+func (u *ui) buildJumpButton() {
+	b := appkit.NewButtonWithTitle("")
+	if img := appkit.Image_ImageWithSystemSymbolNameAccessibilityDescription("chevron.down", "Jump to bottom"); !img.IsNil() {
+		b.SetImage(img)
+		b.SetImagePosition(appkit.ImageOnly)
+	} else {
+		b.SetTitle("▼")
+	}
+	b.SetBezelStyle(appkit.BezelStyleCircular)
+	b.SetToolTip("Jump to bottom")
+	b.SetTranslatesAutoresizingMaskIntoConstraints(false)
+	b.SetHidden(true)
+	action.Set(b, func(objc.Object) { u.jumpToBottom() })
+
+	u.logsScroll.AddSubview(b)
+	b.TrailingAnchor().ConstraintEqualToAnchorConstant(u.logsScroll.TrailingAnchor(), -12).SetActive(true)
+	b.BottomAnchor().ConstraintEqualToAnchorConstant(u.logsScroll.BottomAnchor(), -12).SetActive(true)
+	u.jumpBtn = b
+}
+
+// clearLogs empties the on-screen logs buffer for the selected container. The
+// stream keeps running, so new lines still arrive; switching away and back
+// re-fetches the tail.
+func (u *ui) clearLogs() {
+	u.logsView.SetString("")
+	u.jumpBtn.SetHidden(true)
+}
+
+// jumpToBottom scrolls the logs view to the end and hides the jump button;
+// subsequent streamed writes resume tailing because the view is now at bottom.
+func (u *ui) jumpToBottom() {
+	length := u.logsView.TextStorage().Length()
+	u.logsView.ScrollRangeToVisible(foundation.Range{Location: uint64(length), Length: 0})
+	u.jumpBtn.SetHidden(true)
 }
 
 // iconButton makes a bezeled button with an SF Symbol prefix and (optional)
@@ -558,9 +606,10 @@ func (u *ui) startLogs(c core.Container) {
 	u.logsCancel = cancel
 
 	u.logsView.SetString("")
+	u.jumpBtn.SetHidden(true)
 	u.setStatus(fmt.Sprintf("Streaming logs for %s/%s…", c.Project, c.Name))
 
-	w := &textViewWriter{tv: u.logsView, attrs: textAttrs()}
+	w := &textViewWriter{tv: u.logsView, scroll: u.logsScroll, jumpBtn: u.jumpBtn, attrs: textAttrs()}
 	go func() {
 		_ = u.docker.StreamLogs(ctx, c.ID, w)
 	}()
@@ -809,9 +858,13 @@ Pass project names as arguments to filter the sidebar:
 // font — a plain AppendString would inherit no color and render black
 // (invisible in dark mode), and the raw escape bytes would show as garbage.
 type textViewWriter struct {
-	tv    appkit.TextView
-	attrs map[foundation.AttributedStringKey]objc.IObject
-	ansi  ansiParser
+	tv     appkit.TextView
+	scroll appkit.ScrollView
+	// jumpBtn is revealed when a batch is appended while the user is scrolled up
+	// away from the tail, and hidden once they're following the bottom again.
+	jumpBtn appkit.Button
+	attrs   map[foundation.AttributedStringKey]objc.IObject
+	ansi    ansiParser
 }
 
 func (w *textViewWriter) Write(p []byte) (int, error) {
@@ -820,6 +873,9 @@ func (w *textViewWriter) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 	dispatch.MainQueue().DispatchAsync(func() {
+		// Only follow the tail if the user was already at the bottom before this
+		// batch is appended; if they scrolled up to read, leave their view put.
+		atBottom := w.atBottom()
 		storage := w.tv.TextStorage()
 		for _, r := range runs {
 			attrs := w.attrs
@@ -831,7 +887,23 @@ func (w *textViewWriter) Write(p []byte) (int, error) {
 			}
 			storage.AppendAttributedString(foundation.NewAttributedStringWithStringAttributes(r.text, attrs))
 		}
-		w.tv.ScrollRangeToVisible(foundation.Range{Location: uint64(storage.Length()), Length: 0})
+		if atBottom {
+			w.tv.ScrollRangeToVisible(foundation.Range{Location: uint64(storage.Length()), Length: 0})
+		}
+		// Show the jump-to-bottom affordance exactly while the user is away from
+		// the tail; hide it once following resumes.
+		w.jumpBtn.SetHidden(atBottom)
 	})
 	return len(p), nil
+}
+
+// atBottom reports whether the log view is scrolled to (or within a line of)
+// the end of its content, so new output should keep the tail in view.
+func (w *textViewWriter) atBottom() bool {
+	visible := w.scroll.DocumentVisibleRect()
+	docHeight := w.tv.Frame().Size.Height
+	// One line of slack absorbs sub-pixel rounding and the case where content
+	// is shorter than the viewport (nothing to scroll).
+	const slack = 24
+	return visible.Origin.Y+visible.Size.Height >= docHeight-slack
 }
